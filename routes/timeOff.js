@@ -13,6 +13,11 @@ const { balanceTypeRefusal, employmentTypeOf, hasEmploymentColumn } = require('.
 const BALANCE_TYPES = new Set(['PTO', 'UPTO']);
 const BALANCE_NEUTRAL_TYPES = new Set(['Lunch', 'Meeting', 'Unavailable', 'Other']);
 const ALL_TYPES = new Set([...BALANCE_TYPES, ...BALANCE_NEUTRAL_TYPES]);
+// Time staff set for themselves with no approval (Kieran, Oct 2026): their
+// own lunch, meetings and unavailable time go straight onto the schedule,
+// new or changed (deleting was already immediate). PTO / UPTO and Other
+// still wait for an admin, and so do contracted hours (routes/hoursRequests.js).
+const SELF_SERVE_TYPES = new Set(['Lunch', 'Meeting', 'Unavailable']);
 
 // Straightforward duration in hours between two exact datetimes, nights and
 // weekends included. No longer what PTO/UPTO costs -- that's the scheduled
@@ -557,6 +562,23 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       await client.query(`DELETE FROM "TimeOffRequests" WHERE replaces_request_id=$1 AND status='pending'`, [String(locked.id)]);
       await client.query('DELETE FROM "TimeOffRequests" WHERE id=$1', [locked.id]);
     };
+
+    // Self-serve time: approved on the spot by its owner. A change only
+    // counts when it stays self-serve both ways -- turning approved Other
+    // time into Lunch, or Lunch into PTO, still goes to an admin.
+    const selfServe = !adminAdding && SELF_SERVE_TYPES.has(request_type) && (!original || SELF_SERVE_TYPES.has(original.request_type));
+    if (selfServe) {
+      try {
+        const approved = await inTransaction(db, async (client) => {
+          const row = await insertRequest(client, withCreatedBy, currentUser.username, currentUser.username, fields, extra);
+          return approveWithReplacement(client, row, currentUser.username);
+        });
+        return json(201, { ...approved, self_approved: true });
+      } catch (err) {
+        if (err instanceof TimeOffError) return json(err.status, { error: err.message, ...err.extra });
+        throw err;
+      }
+    }
 
     if (!adminAdding) {
       if (!cancelsOriginal) {

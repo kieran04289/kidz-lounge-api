@@ -203,6 +203,8 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     await db.query('UPDATE "Staff" SET provider_name=NULL WHERE provider_name=$1', [name]);
     const changesTable = await db.query(`SELECT to_regclass('"ProviderScheduleChanges"') IS NOT NULL AS ok`);
     if (changesTable.rows[0]?.ok) await db.query('DELETE FROM "ProviderScheduleChanges" WHERE provider=$1', [name]);
+    const hoursRequests = await db.query(`SELECT to_regclass('"HoursChangeRequests"') IS NOT NULL AS ok`);
+    if (hoursRequests.rows[0]?.ok) await db.query('DELETE FROM "HoursChangeRequests" WHERE provider=$1', [name]);
     await db.query('DELETE FROM "Providers" WHERE id=$1', [id]);
     return json(200, { deleted: true });
   }

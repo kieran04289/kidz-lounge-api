@@ -1,6 +1,6 @@
 const { json } = require('../lib/http');
 const { canAdminister } = require('../lib/roles');
-const { hasChangesTable, loadChangesByProvider, scheduleForDate } = require('../lib/scheduleChanges');
+const { hasChangesTable, loadChangesByProvider, scheduleForDate, scheduleChangeProblem, saveChangeDays, insertScheduleChange } = require('../lib/scheduleChanges');
 
 const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
@@ -208,29 +208,8 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     if (changesRoute && method === 'GET') return json(200, await listFor(decodeURIComponent(changesRoute[1])));
     if (!canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
 
-    const validate = () => {
-      const { start_date, end_date, schedule } = body;
-      const isDate = (d) => /^\d{4}-\d{2}-\d{2}$/.test(d || '');
-      if (!isDate(start_date)) return 'A start date is required.';
-      if (end_date && !isDate(end_date)) return 'The end date is not a valid date.';
-      if (end_date && end_date < start_date) return 'The end date is before the start date.';
-      if (!Array.isArray(schedule)) return 'schedule must be an array.';
-      const seen = new Set();
-      for (const d of schedule) {
-        const wd = Number(d.weekday);
-        if (!Number.isInteger(wd) || wd < 0 || wd > 6) return 'Each day needs a weekday (0-6).';
-        if (seen.has(wd)) return 'Each weekday can only appear once.';
-        seen.add(wd);
-        if (!d.start_time || !d.end_time || toMinutes(d.end_time) <= toMinutes(d.start_time)) return `${WEEKDAY_NAMES[wd]}: the end time must be after the start time.`;
-      }
-      return null;
-    };
-    const saveDays = async (client, changeId) => {
-      await client.query('DELETE FROM "ProviderScheduleChangeDays" WHERE change_id=$1', [changeId]);
-      for (const d of body.schedule) {
-        await client.query('INSERT INTO "ProviderScheduleChangeDays" (change_id, weekday, start_time, end_time) VALUES ($1,$2,$3,$4)', [changeId, Number(d.weekday), d.start_time, d.end_time]);
-      }
-    };
+    const validate = () => scheduleChangeProblem(body);
+    const saveDays = (client, changeId) => saveChangeDays(client, changeId, body.schedule);
     const inTx = async (fn) => {
       const client = await db.connect();
       try { await client.query('BEGIN'); const r = await fn(client); await client.query('COMMIT'); return r; }
@@ -242,14 +221,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       const problem = validate();
       if (problem) return json(400, { error: problem });
       const providerName = decodeURIComponent(changesRoute[1]);
-      const created = await inTx(async (client) => {
-        const res = await client.query(
-          'INSERT INTO "ProviderScheduleChanges" (provider, start_date, end_date, created_by) VALUES ($1,$2,$3,$4) RETURNING id',
-          [providerName, body.start_date, body.end_date || null, currentUser.username]
-        );
-        await saveDays(client, res.rows[0].id);
-        return res.rows[0].id;
-      });
+      const created = await inTx((client) => insertScheduleChange(client, providerName, body, currentUser.username));
       return json(201, { id: created, changes: await listFor(providerName) });
     }
     if (changeIdRoute && (method === 'PUT' || method === 'DELETE')) {
