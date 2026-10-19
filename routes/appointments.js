@@ -5,6 +5,7 @@ const { getMergedAppointments, hasMakeupColumn, MISSED_STATUSES } = require('../
 const { isHold } = require('../lib/caseload');
 const { applyCancelReason, isOffsiteArea } = require('../lib/cancelReason');
 const { applyOutsideHours } = require('../lib/outsideHours');
+const { applyHoursOkFromBody, hasHoursOkColumns, canOkay, setOkay, okayRow, MIGRATION: HOURS_OK_MIGRATION } = require('../lib/hoursOk');
 const { applyAbsenceReason } = require('../lib/absenceReason');
 const { signedRecordsFor } = require('../lib/sessionNotes');
 
@@ -37,7 +38,9 @@ async function signedSeriesFrom(db, seriesId, fromDate) {
 // (Oct 16 2026), whatever the caller sent; School / Home / Virtual (not a
 // real room) stay as they are. Mirrors the frontend's appointmentSetting.js.
 const areaAfterStatus = (status, area) => (MISSED_STATUSES.includes(status) && area && !isOffsiteArea(area) && area !== 'Virtual' ? 'Center' : (area || null));
-const applySessionDetails = async (db, row, body, opts) => applyOutsideHours(db, await applyAbsenceReason(db, await applyCancelReason(db, row, body), body), body, opts);
+// `user` lets a save carry "Okay outside my hours" (lib/hoursOk.js), applied last.
+const applySessionDetails = async (db, row, body, opts, user) => applyHoursOkFromBody(db, 'Appointments',
+  await applyOutsideHours(db, await applyAbsenceReason(db, await applyCancelReason(db, row, body), body), body, opts), body, user);
 
 // Positive-only cache, so booking works before the evals migration (the
 // appointment just isn't flagged).
@@ -141,6 +144,33 @@ async function handle(ctx) {
     return json(200, result.rows);
   }
 
+  // "Okay outside my hours" (lib/hoursOk.js): { ok: true, note } okays a
+  // session outside its provider's contracted hours, { ok: false } takes it
+  // back. The session's own provider, or an Admin / Developer. A weekly
+  // series is okayed as a whole: from a virtual occurrence use
+  // /recurring-series/:id/hours-ok; an edited occurrence okays its series too.
+  const hoursOkRoute = path.match(/^\/(appointments|recurring-series)\/([^/]+)\/hours-ok$/);
+  if (hoursOkRoute && method === 'PUT') {
+    if (!(await hasHoursOkColumns(db))) return json(503, { error: `Okaying sessions outside contracted hours needs the database update (${HOURS_OK_MIGRATION}) to be run first.` });
+    const table = hoursOkRoute[1] === 'appointments' ? 'Appointments' : 'RecurringSeries';
+    const row = (await db.query(`SELECT * FROM "${table}" WHERE id::text=$1`, [hoursOkRoute[2]])).rows[0];
+    if (!row || row.deleted) return json(404, { error: 'That session no longer exists. Refresh the schedule.' });
+    if (!canOkay(currentUser, row.provider)) return json(403, { error: `Only ${row.provider} or an admin can okay a session outside their contracted hours.` });
+    const ok = body.ok !== false;
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      const saved = await okayRow(client, table, row, { ok, note: body.note, username: currentUser.username });
+      await client.query('COMMIT');
+      return json(200, saved);
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   if (path === '/appointments' && method === 'GET') {
     const date = qs.date;
     const merged = await getMergedAppointments(db, { startDate: date, endDate: date });
@@ -173,15 +203,15 @@ async function handle(ctx) {
     );
     if (makeupFor !== null) {
       const marked = await db.query('UPDATE "Appointments" SET makeup_for=$1, is_makeup=true WHERE id=$2 RETURNING *', [makeupFor, result.rows[0].id]);
-      return json(201, await applySessionDetails(db, marked.rows[0], body));
+      return json(201, await applySessionDetails(db, marked.rows[0], body, undefined, currentUser));
     }
     // An eval (booked from the patient chart; migrations/2026-10-19_evals.sql).
     if (body.is_eval === true) {
-      if (!(await hasEvalColumn(db))) return json(201, await applySessionDetails(db, result.rows[0], body));
+      if (!(await hasEvalColumn(db))) return json(201, await applySessionDetails(db, result.rows[0], body, undefined, currentUser));
       const marked = await db.query('UPDATE "Appointments" SET is_eval=true WHERE id=$1 RETURNING *', [result.rows[0].id]);
-      return json(201, await applySessionDetails(db, marked.rows[0], body));
+      return json(201, await applySessionDetails(db, marked.rows[0], body, undefined, currentUser));
     }
-    return json(201, await applySessionDetails(db, result.rows[0], body));
+    return json(201, await applySessionDetails(db, result.rows[0], body, undefined, currentUser));
   }
 
   if (path.match(/^\/appointments\/[^/]+$/) && method === 'PUT') {
@@ -220,7 +250,7 @@ async function handle(ctx) {
         id,
       ]
     );
-    return json(200, await applySessionDetails(db, result.rows[0], body));
+    return json(200, await applySessionDetails(db, result.rows[0], body, undefined, currentUser));
   }
 
   if (path.match(/^\/appointments\/[^/]+\/comments$/) && method === 'PUT') {
@@ -296,7 +326,7 @@ async function handle(ctx) {
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
       [patient_name, provider, weekday, appointment_time, duration || 30, treatment_area || null, appointment_status || 'Scheduled', start_date, end_date || null]
     );
-    return json(201, await applyOutsideHours(db, result.rows[0], body, { table: 'RecurringSeries' }));
+    return json(201, await applyHoursOkFromBody(db, 'RecurringSeries', await applyOutsideHours(db, result.rows[0], body, { table: 'RecurringSeries' }), body, currentUser));
   }
 
   // Ends a series at a given date (used for "edit this and all future" --
@@ -451,7 +481,7 @@ async function handle(ctx) {
       ]
     );
     // An occurrence of an outside-hours series stays outside hours unless told otherwise.
-    return json(201, await applySessionDetails(db, result.rows[0], body, { fallback: !!series.outside_hours }));
+    return json(201, await applySessionDetails(db, result.rows[0], body, { fallback: !!series.outside_hours }, currentUser));
   }
 
   // Marks an existing real exception row as deleted, rather than removing
