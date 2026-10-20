@@ -27,7 +27,8 @@ const safely = async (fn) => { try { return await fn(); } catch (err) { console.
 // three direct lookups (the full Compliance sections cover everyone).
 async function cosignFor(db, own, today) {
   const { COSIGN_DAYS } = require('../lib/sessionNotes');
-  const due = (signedAt) => { const d = new Date(signedAt); d.setDate(d.getDate() + COSIGN_DAYS); return d.toISOString().slice(0, 10); };
+  // The clinic's date it was signed on (a UTC date was a day out in the evening).
+  const due = (signedAt) => require('../lib/eiLifecycle').addDays(clinicToday(new Date(signedAt)), COSIGN_DAYS);
   const item = (r, href, what) => {
     const by = due(r.provider_signed_at);
     return { patient_name: r.patient_name, provider: r.provider, date: by, href, kind: 'needs_supervisor', text: `${what}: co-sign by ${by}`, severity: by < today ? 'danger' : 'warning' };
@@ -73,7 +74,9 @@ async function providerWork(db, own, username, today, all) {
     today: todayRows,
     notes: notes === null ? null : sorted(mine(notes).filter(x => x.kind !== 'needs_supervisor')),
     cosign: cosign === null ? null : sorted(cosign),
-    reports: reports === null && evals === null ? null : sorted([...mine(reports).filter(x => x.kind === 'due'), ...mine(evals).filter(x => x.kind !== 'needs_supervisor')]),
+    // A report waiting on the supervisor's co-signature isn't the
+    // provider's to do (it's under the supervisor's To co-sign).
+    reports: reports === null && evals === null ? null : sorted([...mine(reports).filter(x => x.kind === 'due' && x.status !== 'needs_supervisor'), ...mine(evals).filter(x => x.kind !== 'needs_supervisor')]),
     makeups,
   };
 }

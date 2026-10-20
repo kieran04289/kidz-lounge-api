@@ -71,7 +71,18 @@ async function todoFor(db, patient, { manager, intake, outside }) {
     const end = ifsp && life.day(ifsp.end_date);
     if (end && end <= life.addDays(today, 66)) {
       const due = life.addDays(end, -PROGRESS_REPORT_LEAD_DAYS);
-      items.push({ key: 'reports', text: `Progress reports due ${nice(due)} (IFSP ends ${nice(end)})`, tab: 'ifsp', severity: due < today ? 'danger' : 'warning' });
+      // Only the reports still to write or sign: this used to show from
+      // the IFSP's end date alone, even with every report signed or sent.
+      let left = null;
+      try {
+        if (await life.exists(db, 'EiProgressReports')) {
+          const owed = (await require('./progressReports').dueReports(db, { provider: null, patientId: patient.id })).filter(d => String(d.ifsp_id) === String(ifsp.id));
+          const done = new Set((await db.query('SELECT provider, service, report_type FROM "EiProgressReports" WHERE ifsp_id=$1 AND provider_signed_at IS NOT NULL', [ifsp.id])).rows
+            .map(r => `${r.provider}|${r.service}|${r.report_type}`));
+          left = owed.filter(d => !done.has(`${d.provider}|${d.service}|${d.report_type}`)).length;
+        }
+      } catch (err) { console.error('todo reports', err); }
+      if (left !== 0) items.push({ key: 'reports', text: `${left ? `${left} progress report${left === 1 ? '' : 's'}` : 'Progress reports'} due ${nice(due)} (IFSP ends ${nice(end)})`, tab: 'ifsp', severity: due < today ? 'danger' : 'warning' });
     }
   }
   if (manager && await life.exists(db, 'EiAuthorizations')) {

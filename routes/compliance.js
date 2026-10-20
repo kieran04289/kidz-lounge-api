@@ -89,15 +89,22 @@ async function notesSection(db, today, provider = null) {
 async function reportsSection(db, today, provider = null) {
   if (!(await exists(db, 'EiProgressReports'))) return [];
   const { dueReports } = require('./progressReports');
-  const [due, rows] = await Promise.all([
+  const [due, rows, all] = await Promise.all([
     dueReports(db, { provider, patientId: null }),
     db.query(
       `SELECT r.*, p."Name" AS patient_name FROM "EiProgressReports" r JOIN "Patients" p ON p.id = r.patient_id WHERE r.sent_on IS NULL${provider ? ' AND r.provider = $1' : ''}`,
       provider ? [provider] : []
     ).then(r => r.rows),
+    // Every report ever started, sent ones included: "not started" was
+    // worked out from the unsent ones only, so once a report was sent its
+    // due entry came back as "not started" (Oct 2026, My work).
+    db.query(
+      `SELECT patient_id, ifsp_id, provider, service, report_type FROM "EiProgressReports"${provider ? ' WHERE provider = $1' : ''}`,
+      provider ? [provider] : []
+    ).then(r => r.rows),
   ]);
   const key = (x) => `${x.patient_id}|${x.ifsp_id}|${x.provider}|${x.service}|${x.report_type}`;
-  const started = new Set(rows.map(key));
+  const started = new Set(all.map(key));
   const out = [];
   for (const d of due) {
     if (started.has(key(d))) continue;

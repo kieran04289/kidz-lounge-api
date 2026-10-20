@@ -139,7 +139,13 @@ async function handle({ path, method, qs, body, db, currentUser }) {
        FROM "EiProgressReports" r JOIN "Patients" p ON p.id = r.patient_id ${where} ORDER BY r.due_date NULLS LAST, r.id`, params
     )).rows;
     const key = (x) => `${x.patient_id}|${x.ifsp_id}|${x.provider}|${x.service}|${x.report_type}`;
-    const started = new Map(reports.map(r => [key(r), r]));
+    // Sent more than 60 days ago reports aren't listed, but they're still
+    // written: without them their due entry came back as "Not started".
+    const startedParams = [];
+    let startedWhere = '';
+    if (provider) { startedParams.push(provider); startedWhere = ` WHERE provider = $1`; }
+    const everStarted = (await db.query(`SELECT patient_id, ifsp_id, provider, service, report_type FROM "EiProgressReports"${startedWhere}`, startedParams)).rows;
+    const started = new Map([...everStarted.map(r => [key(r), r]), ...reports.map(r => [key(r), r])]);
     const rows = [
       ...due.filter(d => !started.has(key(d))).map(d => ({ ...d, id: null, status: 'not_started' })),
       ...reports.map(r => ({ ...r, ifsp_start: day10(r.ifsp_start), ifsp_end: day10(r.ifsp_end), due_date: day10(r.due_date), status: pr.reportStatus(r) })),
