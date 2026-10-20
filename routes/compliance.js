@@ -101,7 +101,8 @@ async function reportsSection(db, today, provider = null) {
   const out = [];
   for (const d of due) {
     if (started.has(key(d))) continue;
-    out.push({ patient_name: d.patient_name, patient_id: d.patient_id, provider: d.provider, date: d.due_date, href: '/progress-reports', kind: 'due', text: `${d.service} progress report not started`, severity: d.due_date < today ? 'danger' : 'warning' });
+    // `start`: what My work needs to start it and open it in one click.
+    out.push({ patient_name: d.patient_name, patient_id: d.patient_id, provider: d.provider, date: d.due_date, href: '/progress-reports', start: { patient_id: d.patient_id, ifsp_id: d.ifsp_id, service: d.service, report_type: d.report_type }, kind: 'due', text: `${d.service} progress report not started`, severity: d.due_date < today ? 'danger' : 'warning' });
   }
   for (const r of rows) {
     const status = pr.reportStatus(r);
