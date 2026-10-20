@@ -67,7 +67,7 @@ async function notesSection(db, today) {
     else if (status === 'needs_provider') out.push({ ...base, kind: 'to_write', text: 'Parent signed; the provider hasn\'t', severity: 'warning' });
     else if (status === 'needs_supervisor') {
       const due = ifspLib.addDays(day10(new Date(n.provider_signed_at).toISOString()), notesLib.COSIGN_DAYS);
-      out.push({ ...base, kind: 'needs_supervisor', text: `Needs ${n.supervisor_name}'s co-signature by ${nice(due)}`, severity: due < today ? 'danger' : 'warning' });
+      out.push({ ...base, kind: 'needs_supervisor', supervisor: n.supervisor_name, text: `Needs ${n.supervisor_name}'s co-signature by ${nice(due)}`, severity: due < today ? 'danger' : 'warning' });
     }
   }
   // Older notes still waiting on a co-signature (past the two months above).
@@ -101,7 +101,7 @@ async function reportsSection(db, today) {
   for (const r of rows) {
     const status = pr.reportStatus(r);
     const dueDate = day10(r.due_date);
-    const base = { patient_name: r.patient_name, patient_id: r.patient_id, provider: r.provider, date: dueDate, href: `/progress-reports/${r.id}` };
+    const base = { patient_name: r.patient_name, patient_id: r.patient_id, provider: r.provider, date: dueDate, href: `/progress-reports/${r.id}`, report_id: r.id, status, supervisor: status === 'needs_supervisor' ? r.supervisor_name : undefined };
     if (status === 'to_approve') out.push({ ...base, kind: 'to_approve', text: `${r.service} progress report to approve`, severity: dueDate && dueDate < today ? 'danger' : 'warning' });
     else if (status === 'approved') out.push({ ...base, kind: 'not_sent', text: `${r.service} progress report approved, not sent to the service coordinator`, severity: 'warning' });
     else if (status === 'returned') out.push({ ...base, kind: 'due', text: `${r.service} progress report returned: waiting for the provider's addendum`, severity: 'warning' });
@@ -124,7 +124,7 @@ async function evalsSection(db, today) {
     const due = ev.dueDateOf(e.appointment_date);
     out.push({
       patient_name: e.patient_name, patient_id: e.patient_id, provider: e.provider, date: due, href: `/eval-reports/report?key=${encodeURIComponent(e.key)}`,
-      kind: status, text: `Evaluation on ${nice(e.appointment_date)}: ${{ none: 'report not written', late: 'report not written', draft: 'report in draft', needs_supervisor: 'needs a co-signature' }[status]}`,
+      kind: status, supervisor: status === 'needs_supervisor' ? byKey[e.key]?.supervisor_name : undefined, text: `Evaluation on ${nice(e.appointment_date)}: ${{ none: 'report not written', late: 'report not written', draft: 'report in draft', needs_supervisor: 'needs a co-signature' }[status]}`,
       severity: due < today ? 'danger' : 'warning',
     });
   }
@@ -336,4 +336,5 @@ async function handle({ path, method, body, db, currentUser }) {
   return json(200, { today, sections });
 }
 
-module.exports = { handle };
+// My work (routes/myWork.js) reuses these, filtered to the person.
+module.exports = { handle, sections: { notes: notesSection, reports: reportsSection, evals: evalsSection } };

@@ -228,9 +228,18 @@ async function handle({ path, method, qs, body, db, currentUser }) {
 
   if (path === '/session-notes/note' && method === 'GET') {
     const { patient, ...session } = info;
+    // A new note starts from this provider's last signed note for the child
+    // and service (Kieran, Oct 2026): who took part, delivery, how they worked
+    // with the parent, strategies. What happened and the outcomes worked on
+    // are left blank: they're about this session.
+    const previous = !note && mine && !info.cancelled ? (await db.query(
+      `SELECT session_date, delivery, participants, participants_other, parent_methods, parent_methods_other, strategies FROM "EiSessionNotes"
+       WHERE patient_id=$1 AND provider=$2 AND service=$3 AND session_date < $4 AND provider_signed_at IS NOT NULL AND NOT cancelled
+       ORDER BY session_date DESC LIMIT 1`, [patient.id, info.provider, info.service, info.date]
+    ).catch(() => ({ rows: [] }))).rows[0] || null : null;
     return json(200, {
       session: { ...session, patient_id: patient.id, patient_name: patient.Name },
-      note: shown(note), addenda, can_write: !!mine,
+      note: shown(note), addenda, can_write: !!mine, previous,
       can_cosign: !!(supervising && note?.supervisor_name === own && note.provider_signed_at && !note.supervisor_signed_at),
       cosign_days: notes.COSIGN_DAYS,
       status: notes.noteStatus(note),

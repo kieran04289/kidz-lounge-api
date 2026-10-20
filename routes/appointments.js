@@ -8,6 +8,8 @@ const { applyOutsideHours } = require('../lib/outsideHours');
 const { applyHoursOkFromBody, hasHoursOkColumns, canOkay, setOkay, okayRow, MIGRATION: HOURS_OK_MIGRATION } = require('../lib/hoursOk');
 const { applyAbsenceReason } = require('../lib/absenceReason');
 const { applyMissedBy } = require('../lib/missedBy');
+// PedsDesk: each EI session's note status for the schedule cards.
+const eiNoteMarks = (db, rows) => (require('../lib/features').featureOn('ei') ? require('../lib/eiNoteMarks').markEiNotes(db, rows) : rows);
 const { signedRecordsFor } = require('../lib/sessionNotes');
 
 // PedsDesk's EI records (the "ei" feature): a session with a signed session
@@ -148,7 +150,7 @@ async function handle(ctx) {
     }
     if (!provider || !start || !end) return json(400, { error: 'provider, start, and end are required.' });
     const merged = await getMergedAppointments(db, { startDate: start, endDate: end, provider });
-    return json(200, merged);
+    return json(200, await eiNoteMarks(db, merged));
   }
 
   if (path === '/appointments/series-matches' && method === 'GET') {
@@ -206,7 +208,7 @@ async function handle(ctx) {
   if (path === '/appointments' && method === 'GET') {
     const date = qs.date;
     const merged = await getMergedAppointments(db, { startDate: date, endDate: date });
-    return json(200, merged);
+    return json(200, await eiNoteMarks(db, merged));
   }
 
   if (path === '/appointments' && method === 'POST') {
