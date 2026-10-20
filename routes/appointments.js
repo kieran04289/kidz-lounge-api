@@ -7,6 +7,7 @@ const { applyCancelReason, isOffsiteArea } = require('../lib/cancelReason');
 const { applyOutsideHours } = require('../lib/outsideHours');
 const { applyHoursOkFromBody, hasHoursOkColumns, canOkay, setOkay, okayRow, MIGRATION: HOURS_OK_MIGRATION } = require('../lib/hoursOk');
 const { applyAbsenceReason } = require('../lib/absenceReason');
+const { applyMissedBy } = require('../lib/missedBy');
 const { signedRecordsFor } = require('../lib/sessionNotes');
 
 // PedsDesk's EI records (the "ei" feature): a session with a signed session
@@ -19,6 +20,18 @@ async function signedLock(db, row) {
   const found = await signedRecordsFor(db, [keyOfRow(row)]);
   return found[0] ? json(409, { error: `This session has a signed ${found[0].kind}, so it can't be deleted, moved or re-timed. Correct the record with an addendum instead.`, locked: true }) : null;
 }
+// PedsDesk's EI locations (Kieran, Oct 2026): a session is at the Center (a
+// room, "Center" or "Virtual"), a School or Home -- nothing else. With `ei`
+// on, a save that SETS a retired value ("Offsite" with no setting, the old
+// "Offsite (Center)") is refused; a row that still has one isn't, until
+// someone changes its location. Kidz Lounge (`ei` off) is unaffected.
+const RETIRED_AREA_RE = /^Offsite(?: \(Center\))?(?::.*)?$/;
+function retiredAreaRefusal(newArea, oldArea) {
+  const { featureOn } = require('../lib/features');
+  if (!featureOn('ei') || !newArea || newArea === oldArea || !RETIRED_AREA_RE.test(String(newArea))) return null;
+  return json(400, { error: 'Pick where the session is: Center, School or Home.' });
+}
+
 // Signed records for a weekly series' occurrences on or after a date.
 async function signedSeriesFrom(db, seriesId, fromDate) {
   const { featureOn } = require('../lib/features');
@@ -39,8 +52,27 @@ async function signedSeriesFrom(db, seriesId, fromDate) {
 // real room) stay as they are. Mirrors the frontend's appointmentSetting.js.
 const areaAfterStatus = (status, area) => (MISSED_STATUSES.includes(status) && area && !isOffsiteArea(area) && area !== 'Virtual' ? 'Center' : (area || null));
 // `user` lets a save carry "Okay outside my hours" (lib/hoursOk.js), applied last.
-const applySessionDetails = async (db, row, body, opts, user) => applyHoursOkFromBody(db, 'Appointments',
-  await applyOutsideHours(db, await applyAbsenceReason(db, await applyCancelReason(db, row, body), body), body, opts), body, user);
+// Who missed it (lib/missedBy.js) comes after the absence reason: a provider
+// cancellation clears it.
+const applySessionDetails = async (db, row, body, opts, user) => followUps(db, await applyHoursOkFromBody(db, 'Appointments',
+  await applyOutsideHours(db, await applyMissedBy(db, await applyAbsenceReason(db, await applyCancelReason(db, row, body), body), body, user), body, opts), body, user));
+// PedsDesk ("ei"): a missed EI session's make-up task opens or closes with
+// every save, and booking a make-up closes the original's (lib/eiFollowUps.js).
+// A failure here never fails the save.
+async function followUps(db, row) {
+  if (!require('../lib/features').featureOn('ei')) return row;
+  try {
+    const { syncMakeupTask } = require('../lib/eiFollowUps');
+    await syncMakeupTask(db, row);
+    if (row && row.makeup_for) {
+      const original = (await db.query('SELECT * FROM "Appointments" WHERE id=$1', [row.makeup_for])).rows[0];
+      if (original) await syncMakeupTask(db, original);
+    }
+  } catch (err) {
+    console.error('EI make-up task', err);
+  }
+  return row;
+}
 
 // Positive-only cache, so booking works before the evals migration (the
 // appointment just isn't flagged).
@@ -178,6 +210,7 @@ async function handle(ctx) {
   }
 
   if (path === '/appointments' && method === 'POST') {
+    { const refused = retiredAreaRefusal(body.treatment_area, null); if (refused) return refused; }
     const { patient_name, provider, appointment_date, appointment_time, duration, treatment_area, appointment_status, fin } = body;
     // A make-up for a Canceled / No Show appointment (migrations/2026-10-17_makeups.sql).
     let makeupFor = null;
@@ -219,6 +252,7 @@ async function handle(ctx) {
     const existingRes = await db.query('SELECT * FROM "Appointments" WHERE id=$1', [id]);
     if (!existingRes.rows[0]) return json(404, { error: 'Appointment not found.' });
     const existing = existingRes.rows[0];
+    { const refused = retiredAreaRefusal(mergedField(body, 'treatment_area', existing), existing.treatment_area); if (refused) return refused; }
     // A signed EI record: the session's facts stay as signed (room and
     // comments may still change).
     const day = (v) => (v ? String(v).slice(0, 10) : v);
@@ -317,6 +351,7 @@ async function handle(ctx) {
 
   // ---------- Recurring Series (new rule-based recurring model) ----------
   if (path === '/recurring-series' && method === 'POST') {
+    { const refused = retiredAreaRefusal(body.treatment_area, null); if (refused) return refused; }
     const { patient_name, provider, weekday, appointment_time, duration, treatment_area, appointment_status, start_date, end_date } = body;
     if (!patient_name || !provider || weekday === undefined || weekday === null || !appointment_time || !start_date) {
       return json(400, { error: 'patient_name, provider, weekday, appointment_time, and start_date are required.' });
@@ -456,6 +491,7 @@ async function handle(ctx) {
     const seriesRes = await db.query('SELECT * FROM "RecurringSeries" WHERE id=$1', [seriesId]);
     const series = seriesRes.rows[0];
     if (!series) return json(404, { error: 'Series not found.' });
+    { const refused = retiredAreaRefusal(body.treatment_area, series.treatment_area); if (refused) return refused; }
     // Deleting or moving one occurrence that already has a signed EI record.
     if (deleted || (appointment_date && appointment_date !== occurrence_date) || (appointment_time && String(appointment_time).slice(0, 5) !== String(series.appointment_time).slice(0, 5))
       || (provider && provider !== series.provider) || (patient_name && patient_name !== series.patient_name)) {

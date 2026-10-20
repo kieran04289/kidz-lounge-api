@@ -137,6 +137,11 @@ async function handle({ path, method, qs, body, db, currentUser }) {
       created = (await db.query('SELECT * FROM "Patients" WHERE id=$1', [created.id])).rows[0];
     }
     const withAlerts = (await hasAlertColumns(db)) ? await saveAlertFields(db, created.id, body) : null;
+    // PedsDesk ("ei"): a new EI child gets an intake task for their case
+    // manager (lib/eiLifecycle.js). Never blocks saving the patient.
+    if (require('../lib/features').featureOn('ei') && /(^|[^A-Z])EI([^A-Z]|$)/.test(String(created.Program || ''))) {
+      await require('../lib/eiLifecycle').onNewEiPatient(db, created).catch(err => console.error('EI intake task', err));
+    }
     return json(201, withAlerts || created);
   }
 

@@ -34,6 +34,8 @@ const { clinicToday, isHold } = require('../lib/caseload');
 const { displayNameFor } = require('../lib/utils');
 const notes = require('../lib/sessionNotes');
 const { sessionKey, eiServiceFor, disciplinesOf } = require('./billing');
+const { providerCancelled } = require('../lib/missedBy');
+const sessionCodes = require('../lib/sessionCodes');
 
 const MIGRATION = 'Session notes need the 2026-11-05 database update. It runs with the next deploy.';
 const LINK_DAYS = 7;
@@ -84,7 +86,9 @@ async function eiSessionsFor(db, { month, provider, patientName, through = null,
   ]);
   const closed = new Set(closures.rows.map(c => day10(c.closure_date)));
   const mins = (t) => { const [h, m] = String(t).split(':').map(Number); return h * 60 + (m || 0); };
-  const out = (a) => ooo.some(o => o.provider === a.provider && day10(o.ooo_date) === day10(a.appointment_date)
+  // A session the provider cancelled counts as the provider being out
+  // (lib/missedBy.js), like their time off: PA, no note.
+  const out = (a) => providerCancelled(a) || ooo.some(o => o.provider === a.provider && day10(o.ooo_date) === day10(a.appointment_date)
     && mins(o.start_time) < mins(a.appointment_time) + (Number(a.duration) || 30) && mins(a.appointment_time) < mins(o.end_time));
   // An evaluation takes an evaluation report, not a session note.
   const real = appts.filter(a => a.appointment_status !== '*HOLD*' && !isHold(a.patient_name) && a.patient_name && a.provider && !a.is_eval
@@ -108,6 +112,7 @@ async function eiSessionsFor(db, { month, provider, patientName, through = null,
       patient_name: a.patient_name, patient_id: p.id, provider: a.provider, service: ei.service,
       appointment_status: a.appointment_status, cancelled: ['Canceled', 'No Show'].includes(a.appointment_status), is_makeup: !!a.is_makeup,
       provider_out: includeOut ? out(a) : undefined,
+      provider_cancelled: includeOut ? providerCancelled(a) : undefined,
     });
   }
   return rows.sort((x, y) => x.date.localeCompare(y.date) || x.start_time.localeCompare(y.start_time));
@@ -264,6 +269,18 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   // Everything below writes: only the session's own provider.
   if (!mine) return json(403, { error: "Only the session's provider can write and sign its note." });
   const locked = !!(note && (note.provider_signed_at || note.parent_signed_at));
+
+  // The session's billing codes, set on the note (lib/sessionCodes.js): the
+  // provider's defaults until changed here; locked once the provider signs
+  // (the signature snapshots them). null = back to the defaults.
+  if (path === '/session-notes/note/codes' && method === 'PUT') {
+    if (note?.provider_signed_at) return json(409, { error: 'The codes locked when you signed the note. Ask the office if they need correcting.' });
+    const cleaned = sessionCodes.cleanCodes(info.service, body.codes);
+    if (cleaned.error) return json(400, { error: cleaned.error });
+    await sessionCodes.saveCodes(db, key, cleaned.codes, currentUser.username);
+    const fresh = await notes.sessionInfo(db, appt);
+    return json(200, { billing: fresh.billing });
+  }
 
   if (path === '/session-notes/note' && method === 'PUT') {
     if (locked) return json(409, { error: 'This note has been signed, so it can no longer be changed. Add an addendum instead.' });

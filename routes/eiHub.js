@@ -3,6 +3,7 @@ const { canUseEiHub, canManage } = require('../lib/roles');
 const { featureOn } = require('../lib/features');
 const sessionNotes = require('../lib/sessionNotes');
 const { ALLOWED_CODES, COUNTY_CODES, validNpi, normalizeIcd10, codesFor, linesFor, visitRate } = require('../lib/eiHubCodes');
+const sessionCodes = require('../lib/sessionCodes');
 const { build837, splitName, splitCharge } = require('../lib/ei837');
 const { eiHubSessions } = require('./billing');
 const { getPool } = require('../lib/db');
@@ -144,6 +145,12 @@ async function claimData(db, month) {
   const notesSigned = featureOn('ei') && (await db.query(`SELECT to_regclass('"EiSessionNotes"') AS t`)).rows[0]?.t
     ? await sessionNotes.completeNoteKeys(db, keys) : null;
 
+  // Codes a signed note was signed with (lib/sessionCodes.js), and why the
+  // office re-coded one since.
+  const signedCodes = featureOn('ei') ? await sessionCodes.signedNoteCodes(db, keys) : {};
+  const recodeReasons = (await sessionCodes.hasRecodeReason(db)) && keys.length
+    ? Object.fromEntries((await db.query('SELECT session_key, recode_reason FROM "EiSessionCodes" WHERE session_key = ANY($1) AND recode_reason IS NOT NULL', [keys])).rows.map(r => [r.session_key, r.recode_reason]))
+    : {};
   const rows = sessions.map(x => {
     const problems = [];
     const warnings = [];
@@ -169,6 +176,10 @@ async function claimData(db, month) {
     const override = overrides[x.key] || null;
     const codes = x.service ? codesFor(x.service, x.duration, defaults, override) : [];
     if (x.service && !codes.length) problems.push(`No ${x.service} codes for ${x.provider}`);
+    const noteCodes = signedCodes[x.key];
+    if (noteCodes && !sessionCodes.sameCodes(noteCodes, codes)) {
+      warnings.push(`Codes changed after the note was signed (note: ${noteCodes.join(', ') || 'none'})${recodeReasons[x.key] ? `: ${recodeReasons[x.key]}` : ''}`);
+    }
     if (x.service && ['OT', 'PT', 'SI'].includes(x.service) && x.duration % 15) warnings.push(`${x.duration} minutes isn't a multiple of 15`);
     if (override && x.service && codes.length !== linesFor(x.service, x.duration)) {
       warnings.push(`${codes.length} line${codes.length === 1 ? '' : 's'} for a ${x.duration}-minute session`);
@@ -189,7 +200,7 @@ async function claimData(db, month) {
       key: x.key, date: x.date, start_time: x.start_time, end_time: x.end_time, duration: x.duration,
       patient_name: x.patient_name, provider: x.provider, service: x.service, authorization: x.authorization,
       setting: x.setting, place_of_service: pos, is_makeup: x.is_makeup, is_eval: x.is_eval,
-      codes, codes_changed: !!override, default_lines: x.service ? linesFor(x.service, x.duration) : 0,
+      codes, codes_changed: !!override, default_lines: x.service ? linesFor(x.service, x.duration) : 0, note_signed: !!noteCodes,
       lines: codes.map((code, i) => ({ code, charge: charges[i] || 0 })),
       problems, warnings,
       claim: claim ? { claim_number: claim.claim_number, status: claim.status, file_name: claim.file_name, created_at: claim.created_at, eihub_claim_id: claim.eihub_claim_id } : null,
@@ -376,21 +387,16 @@ async function claimsRoutes({ path, method, qs, body, db, currentUser }) {
     if (!(await hasClaims(db))) return json(409, { error: CLAIMS_MIGRATION });
     const key = String(b.session_key || '');
     if (!/^(appt:[\w-]+|series:[\w-]+:\d{4}-\d{2}-\d{2})$/.test(key)) return json(400, { error: 'Unknown session.' });
-    if (!Array.isArray(b.codes) || !b.codes.length) {
-      await db.query('DELETE FROM "EiSessionCodes" WHERE session_key=$1', [key]);
-      return json(200, { session_key: key, codes: null });
+    const cleaned = sessionCodes.cleanCodes(b.service, b.codes);
+    if (cleaned.error) return json(400, { error: cleaned.error });
+    // Codes come from the session note (lib/sessionCodes.js): once its
+    // provider has signed it, the office re-codes only with a reason.
+    const signed = featureOn('ei') ? (await sessionCodes.signedNoteCodes(db, [key]))[key] : undefined;
+    const reason = String(b.reason || '').trim().slice(0, 500);
+    if (signed && !reason) {
+      return json(409, { error: "This session's note is signed, so its codes come from the note. Give a reason to re-code it.", needs_reason: true });
     }
-    const allowed = (ALLOWED_CODES[b.service] || []).map(x => x.code);
-    const codes = b.codes.map(c => String(c || '').trim().toUpperCase());
-    if (!allowed.length) return json(400, { error: 'Unknown service.' });
-    const bad = codes.find(c => !allowed.includes(c));
-    if (bad) return json(400, { error: `${bad || 'A blank line'} isn't one of the ${b.service} codes.` });
-    if (codes.length > 8) return json(400, { error: 'A session can have up to 8 lines.' });
-    await db.query(
-      `INSERT INTO "EiSessionCodes" (session_key, codes, updated_by, updated_at) VALUES ($1, $2, $3, now())
-       ON CONFLICT (session_key) DO UPDATE SET codes=$2, updated_by=$3, updated_at=now()`,
-      [key, JSON.stringify(codes), currentUser.username]
-    );
+    const codes = await sessionCodes.saveCodes(db, key, cleaned.codes, currentUser.username, signed ? reason : null);
     return json(200, { session_key: key, codes });
   }
 

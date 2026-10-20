@@ -267,14 +267,14 @@ async function startsSection(db, today) {
 const minusBusinessDays = (date, n) => { let d = date; let left = n; while (left > 0) { d = ifspLib.addDays(d, -1); const wd = new Date(`${d}T00:00:00Z`).getUTCDay(); if (wd !== 0 && wd !== 6) left--; } return d; };
 
 // Upcoming provider time off (not lunch or meetings) that falls on EI
-// sessions: the family and service coordinator must be told 5 business days
-// ahead, with the date services resume (10 NYCRR 69-4.9(g)(2)(ii)).
+// sessions, and EI sessions the provider cancelled (lib/missedBy.js): the
+// family and service coordinator must be told 5 business days ahead, with
+// the date services resume (10 NYCRR 69-4.9(g)(2)(ii)).
 async function absencesSection(db, today) {
   const until = ifspLib.addDays(today, 30);
   const { getMergedOOO } = require('../lib/recurring');
   const ooo = (await getMergedOOO(db, { startDate: ifspLib.addDays(today, 1), endDate: until }))
     .filter(o => !['Lunch', 'Meeting'].includes(o.type));
-  if (!ooo.length) return [];
   const { eiSessionsFor } = require('./sessionNotes');
   const sessions = [];
   for (let m = today.slice(0, 7); m <= until.slice(0, 7); m = ifspLib.addMonths(`${m}-01`, 1).slice(0, 7)) {
@@ -282,7 +282,7 @@ async function absencesSection(db, today) {
   }
   // Only real absences (time off), not lunch or meetings.
   const mins = (t) => { const [hh, mm] = String(t).split(':').map(Number); return hh * 60 + (mm || 0); };
-  const away = (s) => ooo.some(o => o.provider === s.provider && day10(o.ooo_date) === s.date
+  const away = (s) => s.provider_cancelled || ooo.some(o => o.provider === s.provider && day10(o.ooo_date) === s.date
     && mins(o.start_time) < mins(s.end_time) && mins(s.start_time) < mins(o.end_time));
   const notices = (await exists(db, 'EiAbsenceNotices'))
     ? new Set((await db.query('SELECT provider, absence_date, patient_id FROM "EiAbsenceNotices" WHERE absence_date > $1', [today])).rows.map(r => `${r.provider}|${day10(r.absence_date)}|${r.patient_id}`))
