@@ -47,11 +47,13 @@ const monthOf = (d) => d.slice(0, 7);
 const prevMonth = (m) => { const [y, mo] = m.split('-').map(Number); const d = new Date(Date.UTC(y, mo - 2, 1)); return d.toISOString().slice(0, 7); };
 const exists = async (db, table) => !!(await db.query('SELECT to_regclass($1) AS t', [`"${table}"`])).rows[0]?.t;
 
-async function notesSection(db, today) {
+// `provider` (My work, routes/myWork.js): only that provider's; the
+// Compliance page passes none, for everyone.
+async function notesSection(db, today, provider = null) {
   if (!(await exists(db, 'EiSessionNotes'))) return [];
   const { eiSessionsFor } = require('./sessionNotes');
-  const sessions = [];
-  for (const month of [prevMonth(monthOf(today)), monthOf(today)]) sessions.push(...await eiSessionsFor(db, { month, provider: null, patientName: null }));
+  const sessions = (await Promise.all([prevMonth(monthOf(today)), monthOf(today)]
+    .map(month => eiSessionsFor(db, { month, provider, patientName: null })))).flat();
   const keys = sessions.map(s => s.key);
   const found = keys.length ? (await db.query('SELECT * FROM "EiSessionNotes" WHERE session_key = ANY($1)', [keys])).rows : [];
   const byKey = Object.fromEntries(found.map(n => [n.session_key, n]));
@@ -84,13 +86,16 @@ async function notesSection(db, today) {
   return out;
 }
 
-async function reportsSection(db, today) {
+async function reportsSection(db, today, provider = null) {
   if (!(await exists(db, 'EiProgressReports'))) return [];
   const { dueReports } = require('./progressReports');
-  const due = await dueReports(db, { provider: null, patientId: null });
-  const rows = (await db.query(
-    `SELECT r.*, p."Name" AS patient_name FROM "EiProgressReports" r JOIN "Patients" p ON p.id = r.patient_id WHERE r.sent_on IS NULL`
-  )).rows;
+  const [due, rows] = await Promise.all([
+    dueReports(db, { provider, patientId: null }),
+    db.query(
+      `SELECT r.*, p."Name" AS patient_name FROM "EiProgressReports" r JOIN "Patients" p ON p.id = r.patient_id WHERE r.sent_on IS NULL${provider ? ' AND r.provider = $1' : ''}`,
+      provider ? [provider] : []
+    ).then(r => r.rows),
+  ]);
   const key = (x) => `${x.patient_id}|${x.ifsp_id}|${x.provider}|${x.service}|${x.report_type}`;
   const started = new Set(rows.map(key));
   const out = [];
@@ -110,10 +115,10 @@ async function reportsSection(db, today) {
   return out;
 }
 
-async function evalsSection(db, today) {
+async function evalsSection(db, today, provider = null) {
   if (!(await exists(db, 'EiEvalReports'))) return [];
   const { evalsBetween } = require('./evalReports');
-  const evals = await evalsBetween(db, { start: ifspLib.addDays(today, -90), end: today, provider: null });
+  const evals = await evalsBetween(db, { start: ifspLib.addDays(today, -90), end: today, provider });
   const keys = evals.map(e => e.key);
   const found = keys.length ? (await db.query('SELECT session_key, details, provider_signed_at, supervisor_name, supervisor_signed_at FROM "EiEvalReports" WHERE session_key = ANY($1)', [keys])).rows : [];
   const byKey = Object.fromEntries(found.map(r => [r.session_key, r]));

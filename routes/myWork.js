@@ -23,38 +23,56 @@ const sorted = (list) => list.sort((a, b) => (a.severity === 'danger' ? 0 : 1) -
 // One section can fail without taking the page down (as on Compliance).
 const safely = async (fn) => { try { return await fn(); } catch (err) { console.error('my-work', err); return null; } };
 
+// Notes, progress reports and evaluations waiting for `own`'s co-signature:
+// three direct lookups (the full Compliance sections cover everyone).
+async function cosignFor(db, own, today) {
+  const { COSIGN_DAYS } = require('../lib/sessionNotes');
+  const due = (signedAt) => { const d = new Date(signedAt); d.setDate(d.getDate() + COSIGN_DAYS); return d.toISOString().slice(0, 10); };
+  const item = (r, href, what) => {
+    const by = due(r.provider_signed_at);
+    return { patient_name: r.patient_name, provider: r.provider, date: by, href, kind: 'needs_supervisor', text: `${what}: co-sign by ${by}`, severity: by < today ? 'danger' : 'warning' };
+  };
+  const q = async (table, cols) => ((await exists(db, table))
+    ? (await db.query(`SELECT ${cols}, t.provider, t.provider_signed_at, p."Name" AS patient_name FROM "${table}" t JOIN "Patients" p ON p.id = t.patient_id
+        WHERE t.supervisor_name=$1 AND t.supervisor_signed_at IS NULL AND t.provider_signed_at IS NOT NULL ORDER BY t.provider_signed_at`, [own])).rows
+    : []);
+  const [notes, reports, evals] = await Promise.all([q('EiSessionNotes', 't.session_key, t.session_date'), q('EiProgressReports', 't.id, t.service'), q('EiEvalReports', 't.session_key')]);
+  return [
+    ...notes.map(r => item(r, `/session-notes/note?key=${encodeURIComponent(r.session_key)}`, `Session note ${day(r.session_date)}`)),
+    ...reports.map(r => item(r, `/progress-reports/${r.id}`, `${r.service} progress report`)),
+    ...evals.map(r => item(r, `/eval-reports/report?key=${encodeURIComponent(r.session_key)}`, 'Evaluation report')),
+  ];
+}
+
 async function providerWork(db, own, username, today, all) {
   const { notes, reports, evals } = all;
-  // Today's sessions (the HOLD placeholder isn't a session).
-  const todayRows = await safely(async () => {
-    const appts = (await getMergedAppointments(db, { startDate: today, endDate: today, provider: own }))
-      .filter(a => !a.deleted && a.appointment_status !== '*HOLD*' && !isHold(a.patient_name))
-      .sort((a, b) => String(a.appointment_time).localeCompare(String(b.appointment_time)));
-    const { eiSessionsFor } = require('./sessionNotes');
-    const ei = new Map((await eiSessionsFor(db, { month: today.slice(0, 7), provider: own, patientName: null })).filter(s => s.date === today).map(s => [s.key, s]));
-    const done = await require('../lib/sessionNotes').completeNoteKeys(db, [...ei.keys()]);
-    return appts.map(a => {
-      const key = a.is_virtual ? `series:${a.series_id}:${day(a.appointment_date)}` : `appt:${a.id}`;
-      const e = ei.get(key) || ei.get(a.exception_of_series_id ? `series:${a.exception_of_series_id}:${day(a.exception_occurrence_date)}` : '') || null;
-      return { appointment: a, note_key: e ? e.key : null, note_done: e ? done.has(e.key) : null };
-    });
-  });
+  const [todayRows, cosign, makeups] = await Promise.all([
+    // Today's sessions with their note status: just today's rows
+    // (lib/eiNoteMarks.js), not a month of sessions.
+    safely(async () => {
+      const appts = (await getMergedAppointments(db, { startDate: today, endDate: today, provider: own }))
+        .filter(a => !a.deleted && a.appointment_status !== '*HOLD*' && !isHold(a.patient_name))
+        .sort((a, b) => String(a.appointment_time).localeCompare(String(b.appointment_time)));
+      const marked = await require('../lib/eiNoteMarks').markEiNotes(db, appts);
+      return marked.map(a => ({ appointment: a, note_key: a.ei_note ? a.ei_note.key : null, note_done: a.ei_note ? a.ei_note.status === 'complete' : null }));
+    }),
+    safely(() => cosignFor(db, own, today)),
+    safely(async () => {
+      const tasks = (await db.query(
+        `SELECT t.id, t.deadline_type, t.deadline_date, t.due_date, p."Name" AS patient_name FROM "Tasks" t LEFT JOIN "Patients" p ON p.id = t.related_patient_id
+         WHERE t.assigned_to=$1 AND t.status <> 'done' AND t.deadline_type LIKE 'ei_makeup_%' ORDER BY t.due_date`, [username]
+      )).rows;
+      const ids = tasks.map(t => t.deadline_type.slice('ei_makeup_'.length));
+      const appts = ids.length ? (await db.query('SELECT * FROM "Appointments" WHERE id::text = ANY($1)', [ids])).rows : [];
+      const byId = Object.fromEntries(appts.map(a => [String(a.id), a]));
+      return tasks.map(t => ({ patient_name: t.patient_name, date: day(t.deadline_date), due: day(t.due_date), severity: day(t.due_date) < today ? 'danger' : 'warning', appointment: byId[t.deadline_type.slice('ei_makeup_'.length)] || null }));
+    }),
+  ]);
   const mine = (list) => (list || []).filter(x => x.provider === own);
-  const toCosign = (list) => (list || []).filter(x => x.kind === 'needs_supervisor' && x.supervisor === own);
-  const makeups = await safely(async () => {
-    const tasks = (await db.query(
-      `SELECT t.id, t.deadline_type, t.deadline_date, t.due_date, p."Name" AS patient_name FROM "Tasks" t LEFT JOIN "Patients" p ON p.id = t.related_patient_id
-       WHERE t.assigned_to=$1 AND t.status <> 'done' AND t.deadline_type LIKE 'ei_makeup_%' ORDER BY t.due_date`, [username]
-    )).rows;
-    const ids = tasks.map(t => t.deadline_type.slice('ei_makeup_'.length));
-    const appts = ids.length ? (await db.query('SELECT * FROM "Appointments" WHERE id::text = ANY($1)', [ids])).rows : [];
-    const byId = Object.fromEntries(appts.map(a => [String(a.id), a]));
-    return tasks.map(t => ({ patient_name: t.patient_name, date: day(t.deadline_date), due: day(t.due_date), severity: day(t.due_date) < today ? 'danger' : 'warning', appointment: byId[t.deadline_type.slice('ei_makeup_'.length)] || null }));
-  });
   return {
     today: todayRows,
     notes: notes === null ? null : sorted(mine(notes).filter(x => x.kind !== 'needs_supervisor')),
-    cosign: notes === null && reports === null ? null : sorted([...toCosign(notes), ...toCosign(reports), ...toCosign(evals)]),
+    cosign: cosign === null ? null : sorted(cosign),
     reports: reports === null && evals === null ? null : sorted([...mine(reports).filter(x => x.kind === 'due'), ...mine(evals).filter(x => x.kind !== 'needs_supervisor')]),
     makeups,
   };
@@ -91,9 +109,10 @@ async function officeWork(db, user, today, all) {
     const hours = (await exists(db, 'HoursChangeRequests')) ? (await db.query(`SELECT count(*)::int AS n FROM "HoursChangeRequests" WHERE status='pending'`)).rows[0].n : 0;
     return { time_off: timeOff, hours };
   }) : undefined;
+  const [intake, authorizations] = await Promise.all([safely(() => openTasks('ei_intake')), safely(() => openTasks('ei_auth_ending_'))]);
   return {
-    intake: await safely(() => openTasks('ei_intake')),
-    authorizations: await safely(() => openTasks('ei_auth_ending_')),
+    intake,
+    authorizations,
     late_notes: lateByProvider && lateByProvider.map(x => ({ ...x, username: staff[x.provider] || null })),
     to_approve: all.reports === null ? null : sorted(all.reports.filter(x => x.kind === 'to_approve' || x.kind === 'not_sent')),
     forms,
@@ -109,18 +128,21 @@ async function handle({ path, method, db, currentUser }) {
   const office = canManage(currentUser);
   const own = currentUser.providerName || null;
   const { sections } = require('./compliance');
-  const all = {
-    notes: await safely(() => sections.notes(db, today)),
-    reports: await safely(() => sections.reports(db, today)),
-    evals: await safely(() => sections.evals(db, today)),
-  };
-  const tasks = (await db.query(`SELECT count(*)::int AS n FROM "Tasks" WHERE assigned_to=$1 AND status <> 'done'`, [currentUser.username])).rows[0].n;
-  return json(200, {
-    today,
-    provider: own ? await providerWork(db, own, currentUser.username, today, all) : null,
-    office: office ? await officeWork(db, currentUser, today, all) : null,
-    open_tasks: tasks,
-  });
+  // The office needs everyone's paperwork; a provider only their own, which
+  // is far less to work out (Oct 2026: My work was slow to open).
+  const scope = office ? null : own;
+  const [notes, reports, evals, tasks] = await Promise.all([
+    safely(() => sections.notes(db, today, scope)),
+    safely(() => sections.reports(db, today, scope)),
+    safely(() => sections.evals(db, today, scope)),
+    db.query(`SELECT count(*)::int AS n FROM "Tasks" WHERE assigned_to=$1 AND status <> 'done'`, [currentUser.username]).then(r => r.rows[0].n),
+  ]);
+  const all = { notes, reports, evals };
+  const [provider, officePart] = await Promise.all([
+    own ? providerWork(db, own, currentUser.username, today, all) : null,
+    office ? officeWork(db, currentUser, today, all) : null,
+  ]);
+  return json(200, { today, provider, office: officePart, open_tasks: tasks });
 }
 
 module.exports = { handle };
