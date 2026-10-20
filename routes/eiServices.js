@@ -109,6 +109,36 @@ const shapeAuth = (a) => ({
   by_hand: a.source === 'hand',
 });
 
+// A new EI mandate for one service from `start` (null = from the beginning,
+// only for a service's first one): the current one ends the day before.
+// Returns { row } or { error } (a plain sentence); `q` is inside the caller's
+// transaction. Shared by the one-service and the all-services saves.
+async function addMandate(q, { patient, service, v, start, currentUser }) {
+      const rows = (await q.query('SELECT * FROM "PatientPrograms" WHERE patient_id=$1 FOR UPDATE', [patient.id])).rows;
+      const other = rows.find(r => r.program !== 'EI' && r.service === service && overlaps(start, null, day(r.start_date), day(r.end_date)));
+      if (other) return { error: `${service} is under ${other.program} ${other.end_date ? `until ${nice(day(other.end_date))}` : 'now'}. A service can only be under one program at a time: change that in the patient form first.` };
+      const mine = rows.filter(r => r.program === 'EI' && r.service === service);
+      const current = mine.find(r => !r.end_date);
+      if (mine.length && !start) return { error: 'Choose the date the new mandate starts. To fix the dates of one already entered, use Fix a mistake.' };
+      if (current && current.start_date && day(current.start_date) >= start) {
+        return { error: `The current ${service} mandate starts on ${nice(day(current.start_date))}, not before ${nice(start)}. To fix its date or numbers, use Fix a mistake on it.` };
+      }
+      if (mine.some(r => r.end_date && day(r.end_date) >= start)) return { error: `An earlier ${service} mandate runs past ${nice(start)}. Use Fix a mistake on it to fix its dates.` };
+      if (current) await q.query('UPDATE "PatientPrograms" SET end_date=$1, ended_by=$2 WHERE id=$3', [addDays(start, -1), currentUser.username, current.id]);
+      // EI with no mandate entered yet: the first mandate replaces it from the date.
+      const placeholder = rows.find(r => r.program === 'EI' && !r.service && !r.end_date);
+      if (placeholder) {
+        if (!start || (placeholder.start_date && day(placeholder.start_date) >= start)) await q.query('DELETE FROM "PatientPrograms" WHERE id=$1', [placeholder.id]);
+        else await q.query('UPDATE "PatientPrograms" SET end_date=$1, ended_by=$2 WHERE id=$3', [addDays(start, -1), currentUser.username, placeholder.id]);
+      }
+      const row = (await q.query(
+        `INSERT INTO "PatientPrograms" (patient_id, program, service, sessions, minutes, start_date, created_by, authorization_number)
+         VALUES ($1, 'EI', $2, $3, $4, $5, $6, $7) RETURNING *`,
+        [patient.id, service, v.sessions, v.minutes, start, currentUser.username, current?.authorization_number || null]
+      )).rows[0];
+      return { row };
+}
+
 async function handle({ path, method, body, db, currentUser }) {
   const m = path.match(/^\/patients\/([^/]+)\/ei-services(?:\/(mandates|authorizations)(?:\/([^/]+))?)?$/);
   if (!m) return null;
@@ -150,6 +180,7 @@ async function handle({ path, method, body, db, currentUser }) {
   }
 
   // ---- Mandates ----
+  // One new mandate from a date (or the first one), for one service.
   if (kind === 'mandates' && !itemId && method === 'POST') {
     const service = String(body?.service || '').toUpperCase();
     if (!SERVICES.includes(service)) return json(400, { error: 'Choose the service.' });
@@ -159,30 +190,41 @@ async function handle({ path, method, body, db, currentUser }) {
     const start = body?.start_date || null;
     if (start !== null && !isDate(start)) return json(400, { error: 'Choose the date the mandate starts.' });
     return inTransaction(db, async (q) => {
-      const rows = (await q.query('SELECT * FROM "PatientPrograms" WHERE patient_id=$1 FOR UPDATE', [patient.id])).rows;
-      const other = rows.find(r => r.program !== 'EI' && r.service === service && overlaps(start, null, day(r.start_date), day(r.end_date)));
-      if (other) return json(409, { error: `${service} is under ${other.program} ${other.end_date ? `until ${nice(day(other.end_date))}` : 'now'}. A service can only be under one program at a time: change that in the patient form first.` });
-      const mine = rows.filter(r => r.program === 'EI' && r.service === service);
-      const current = mine.find(r => !r.end_date);
-      if (mine.length && !start) return json(400, { error: 'Choose the date the new mandate starts. To fix the dates of one already entered, use Correct.' });
-      if (current && current.start_date && day(current.start_date) >= start) {
-        return json(409, { error: `The current ${service} mandate starts on ${nice(day(current.start_date))}, not before ${nice(start)}. To fix its date or numbers, use Correct on it.` });
-      }
-      if (mine.some(r => r.end_date && day(r.end_date) >= start)) return json(409, { error: `An earlier ${service} mandate runs past ${nice(start)}. Use Correct on it to fix its dates.` });
-      if (current) await q.query('UPDATE "PatientPrograms" SET end_date=$1, ended_by=$2 WHERE id=$3', [addDays(start, -1), currentUser.username, current.id]);
-      // EI with no mandate entered yet: the first mandate replaces it from the date.
-      const placeholder = rows.find(r => r.program === 'EI' && !r.service && !r.end_date);
-      if (placeholder) {
-        if (!start || (placeholder.start_date && day(placeholder.start_date) >= start)) await q.query('DELETE FROM "PatientPrograms" WHERE id=$1', [placeholder.id]);
-        else await q.query('UPDATE "PatientPrograms" SET end_date=$1, ended_by=$2 WHERE id=$3', [addDays(start, -1), currentUser.username, placeholder.id]);
-      }
-      const row = (await q.query(
-        `INSERT INTO "PatientPrograms" (patient_id, program, service, sessions, minutes, start_date, created_by, authorization_number)
-         VALUES ($1, 'EI', $2, $3, $4, $5, $6, $7) RETURNING *`,
-        [patient.id, service, v.sessions, v.minutes, start, currentUser.username, current?.authorization_number || null]
-      )).rows[0];
+      const r = await addMandate(q, { patient, service, v, start, currentUser });
+      if (r.error) return json(409, { error: r.error });
       await refreshSummary(q, patient.id);
-      return json(201, shapeMandate(row, office));
+      return json(201, shapeMandate(r.row, office));
+    });
+  }
+
+  // Several services at once (Kieran, Oct 2026: "Update mandates" changes
+  // every service in one go, from one date): { start_date, mandates: [{ service,
+  // sessions, minutes }] }. All or nothing; the error names the service.
+  if (kind === 'mandates' && itemId === 'batch' && method === 'POST') {
+    const list = Array.isArray(body?.mandates) ? body.mandates : [];
+    if (!list.length) return json(400, { error: 'Change at least one service.' });
+    const start = body?.start_date || null;
+    if (start !== null && !isDate(start)) return json(400, { error: 'Choose the date the new mandates start.' });
+    const seen = new Set();
+    const items = [];
+    for (const raw of list) {
+      const service = String(raw?.service || '').toUpperCase();
+      if (!SERVICES.includes(service) || seen.has(service)) return json(400, { error: 'Each service can only be changed once.' });
+      seen.add(service);
+      if (!editable.includes(service)) return json(403, { error: `You can't change the ${service} mandate.` });
+      const v = cleanMandate(raw);
+      if (v.error) return json(400, { error: `${service}: ${v.error}` });
+      items.push({ service, v });
+    }
+    return inTransaction(db, async (q) => {
+      const saved = [];
+      for (const { service, v } of items) {
+        const r = await addMandate(q, { patient, service, v, start, currentUser });
+        if (r.error) return json(409, { error: `${service}: ${r.error}` });
+        saved.push(shapeMandate(r.row, office));
+      }
+      await refreshSummary(q, patient.id);
+      return json(201, { mandates: saved });
     });
   }
 
@@ -206,16 +248,16 @@ async function handle({ path, method, body, db, currentUser }) {
       const next = oldEnd ? others.find(r => r.program === 'EI' && day(r.start_date) === addDays(oldEnd, 1)) : null;
       if (prev && start !== oldStart) {
         if (!start || (prev.start_date && addDays(start, -1) < day(prev.start_date))) {
-          return json(409, { error: `That would cover all of the ${prev.sessions && prev.minutes ? `${prev.sessions}x${prev.minutes} ` : ''}mandate from ${nice(day(prev.start_date))}. Correct or delete that one first.` });
+          return json(409, { error: `That would cover all of the ${prev.sessions && prev.minutes ? `${prev.sessions}x${prev.minutes} ` : ''}mandate from ${nice(day(prev.start_date))}. Fix that one first (Fix a mistake), or delete it.` });
         }
       }
       if (next && end !== oldEnd && day(next.end_date) && addDays(end, 1) > day(next.end_date)) {
-        return json(409, { error: `That would cover all of the next mandate (from ${nice(day(next.start_date))}). Correct or delete that one first.` });
+        return json(409, { error: `That would cover all of the next mandate (from ${nice(day(next.start_date))}). Fix that one first (Fix a mistake), or delete it.` });
       }
       const clash = others.find(r => r !== prev && r !== next && overlaps(start, end, day(r.start_date), day(r.end_date)));
       if (clash) {
         return json(409, { error: clash.program === 'EI'
-          ? `Those dates overlap the ${row.service} mandate from ${nice(day(clash.start_date))}${clash.end_date ? ` to ${nice(day(clash.end_date))}` : ''}. Correct that one first.`
+          ? `Those dates overlap the ${row.service} mandate from ${nice(day(clash.start_date))}${clash.end_date ? ` to ${nice(day(clash.end_date))}` : ''}. Fix that one first (Fix a mistake).`
           : `${row.service} is under ${clash.program} on some of those dates. A service can only be under one program at a time.` });
       }
       if (prev && start !== oldStart) await q.query('UPDATE "PatientPrograms" SET end_date=$1 WHERE id=$2', [addDays(start, -1), prev.id]);
