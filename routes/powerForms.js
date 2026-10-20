@@ -117,7 +117,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   if (path === '/power-forms/setup' && method === 'GET') {
     return json(200, {
       available: await hasTables(db), types: pf.TYPES,
-      chart_fields: Object.fromEntries(Object.entries(pf.CHART_FIELDS).map(([k, v]) => [k, { label: v.label, types: v.types }])),
+      chart_fields: Object.fromEntries(Object.entries(pf.chartFields()).map(([k, v]) => [k, { label: v.label, types: v.types, hint: v.hint || null }])),
       prefill: pf.PREFILL,
       days: DAYS, can_build: canAdminister(currentUser), packages_available: await hasPackets(db),
     });
@@ -254,7 +254,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     return json(200, {
       ...summaryOf(r), intro: r.intro, fields: r.fields, answers, signer_ip: r.submitted_ip,
       patient_name: patient ? patient.Name : null,
-      changes: r.status === 'completed' && patient ? pf.chartChanges(r.fields, answers, patient) : [],
+      changes: r.status === 'completed' && patient ? pf.chartChanges(r.fields, answers, patient, await pf.consentContext(db, r)) : [],
     });
   }
 
@@ -328,16 +328,41 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     const patient = await patientRow(db, r.patient_id);
     if (!patient) return json(404, { error: 'Patient not found.' });
     const wanted = new Set(Array.isArray(b.fields) ? b.fields.map(String) : []);
-    const changes = pf.chartChanges(r.fields, r.answers || {}, patient).filter(c => wanted.has(c.key));
+    const changes = pf.chartChanges(r.fields, r.answers || {}, patient, await pf.consentContext(db, r)).filter(c => wanted.has(c.key));
     if (!changes.length) return json(400, { error: 'Tick at least one change to apply.' });
     // Allergies / Immunizations only once their columns exist.
     const cols = new Set((await db.query(`SELECT column_name FROM information_schema.columns WHERE table_name = 'Patients'`)).rows.map(x => x.column_name));
-    const usable = changes.filter(c => cols.has(c.key));
+    const columns = changes.filter(c => !c.consent && cols.has(c.key));
+    const consents = changes.filter(c => c.consent);
+    const usable = [...columns, ...consents];
     if (!usable.length) return json(400, { error: 'Those chart fields aren\'t available yet.' });
-    await db.query(
-      `UPDATE "Patients" SET ${usable.map((c, i) => `"${c.key}"=$${i + 1}`).join(', ')} WHERE id=$${usable.length + 1}`,
-      [...usable.map(c => c.to), patient.id]
-    );
+    // The form's PDF, when it's already in this child's Documents.
+    const docId = /^\d+$/.test(String(r.document_id || '')) && consents.length
+      && (await db.query('SELECT 1 FROM "PatientDocuments" WHERE id=$1 AND patient_id=$2', [Number(r.document_id), patient.id])).rows.length ? Number(r.document_id) : null;
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      if (columns.length) {
+        await client.query(
+          `UPDATE "Patients" SET ${columns.map((c, i) => `"${c.key}"=$${i + 1}`).join(', ')} WHERE id=$${columns.length + 1}`,
+          [...columns.map(c => c.to), patient.id]
+        );
+      }
+      // EI consents (lib/powerForms.js EI_CHART_FIELDS): recorded as the
+      // IFSP tab's Consents box does, signed the day the form came back.
+      for (const c of consents) {
+        await client.query(
+          'INSERT INTO "EiConsents" (patient_id, kind, service, signed_on, document_id, notes, recorded_by) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+          [patient.id, c.consent.kind, c.consent.service, c.consent.signed_on, docId, `From Power Form "${r.form_name}"`.slice(0, 1000), currentUser.username]
+        );
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
     const applied = [...new Set([...(r.applied_fields || []), ...usable.map(c => c.key)])];
     const row = (await db.query(
       'UPDATE "PowerFormRequests" SET applied_by=$1, applied_at=now(), applied_fields=$2 WHERE id=$3 RETURNING *',
