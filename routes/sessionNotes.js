@@ -120,6 +120,25 @@ async function eiSessionsFor(db, { month, provider, patientName, through = null,
 }
 
 // What the browser sees of a note: never the link's hash.
+// migrations/2026-11-17_note_prefilled_from.sql; only a "yes" is cached,
+// so a warm Lambda picks the migration up.
+let prefilledSeen = false;
+async function hasPrefilledFrom(db) {
+  if (prefilledSeen) return true;
+  prefilledSeen = !!(await db.query(`SELECT 1 FROM information_schema.columns WHERE table_name = 'EiSessionNotes' AND column_name = 'prefilled_from'`)).rows.length;
+  return prefilledSeen;
+}
+
+// The provider's last signed, held note for this child and service before
+// this session: what a new note starts from.
+async function previousNote(db, info) {
+  return (await db.query(
+    `SELECT session_date, delivery, participants, participants_other, parent_methods, parent_methods_other, strategies FROM "EiSessionNotes"
+     WHERE patient_id=$1 AND provider=$2 AND service=$3 AND session_date < $4 AND provider_signed_at IS NOT NULL AND NOT cancelled
+     ORDER BY session_date DESC LIMIT 1`, [info.patient.id, info.provider, info.service, info.date]
+  ).catch(() => ({ rows: [] }))).rows[0] || null;
+}
+
 function shown(note) {
   if (!note) return null;
   const { parent_link_hash, parent_link_failures, parent_link_locked_until, ...rest } = note;
@@ -232,11 +251,7 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     // and service (Kieran, Oct 2026): who took part, delivery, how they worked
     // with the parent, strategies. What happened and the outcomes worked on
     // are left blank: they're about this session.
-    const previous = !note && mine && !info.cancelled ? (await db.query(
-      `SELECT session_date, delivery, participants, participants_other, parent_methods, parent_methods_other, strategies FROM "EiSessionNotes"
-       WHERE patient_id=$1 AND provider=$2 AND service=$3 AND session_date < $4 AND provider_signed_at IS NOT NULL AND NOT cancelled
-       ORDER BY session_date DESC LIMIT 1`, [patient.id, info.provider, info.service, info.date]
-    ).catch(() => ({ rows: [] }))).rows[0] || null : null;
+    const previous = !note && mine && !info.cancelled ? await previousNote(db, info) : null;
     return json(200, {
       session: { ...session, patient_id: patient.id, patient_name: patient.Name },
       note: shown(note), addenda, can_write: !!mine, previous,
@@ -305,6 +320,15 @@ async function handle({ path, method, qs, body, db, currentUser }) {
           value.parent_methods, value.parent_methods_other, value.strategies, currentUser.username]
       )).rows[0];
       if (await hasCompliance(db)) note = await saveGroup(db, note.id, value);
+      // Started from an earlier note (the page sends that note's date):
+      // checked against the same lookup, so only a real one is recorded.
+      const from = /^\d{4}-\d{2}-\d{2}$/.test(String(body?.prefilled_from || '')) ? String(body.prefilled_from) : null;
+      if (from && !info.cancelled && await hasPrefilledFrom(db)) {
+        const prev = await previousNote(db, info);
+        if (prev && String(prev.session_date).slice(0, 10) === from) {
+          note = (await db.query('UPDATE "EiSessionNotes" SET prefilled_from=$1 WHERE id=$2 RETURNING *', [from, note.id])).rows[0];
+        }
+      }
     } else {
       // The session's own details follow the schedule until the first
       // signature (a time or status changed after the draft was started).
