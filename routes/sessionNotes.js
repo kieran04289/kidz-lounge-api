@@ -35,6 +35,7 @@ const { displayNameFor } = require('../lib/utils');
 const notes = require('../lib/sessionNotes');
 const { sessionKey, eiServiceFor, disciplinesOf } = require('./billing');
 const { providerCancelled } = require('../lib/missedBy');
+const { inOffice } = require('../lib/cancelReason');
 const sessionCodes = require('../lib/sessionCodes');
 
 const MIGRATION = 'Session notes need the 2026-11-05 database update. It runs with the next deploy.';
@@ -92,7 +93,7 @@ async function eiSessionsFor(db, { month, provider, patientName, through = null,
     && mins(o.start_time) < mins(a.appointment_time) + (Number(a.duration) || 30) && mins(a.appointment_time) < mins(o.end_time));
   // An evaluation takes an evaluation report, not a session note.
   const real = appts.filter(a => a.appointment_status !== '*HOLD*' && !isHold(a.patient_name) && a.patient_name && a.provider && !a.is_eval
-    && !closed.has(day10(a.appointment_date)) && (includeOut || !out(a)));
+    && !(closed.has(day10(a.appointment_date)) && inOffice(a.treatment_area)) && (includeOut || !out(a)));
   const names = [...new Set(real.map(a => a.patient_name))];
   const patients = names.length ? (await db.query('SELECT id, "Name", "Program" FROM "Patients" WHERE "Name" = ANY($1)', [names])).rows : [];
   const byName = Object.fromEntries(patients.map(p => [p.Name, p]));

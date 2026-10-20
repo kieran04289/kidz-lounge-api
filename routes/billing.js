@@ -8,6 +8,7 @@ const { makeMarker, loadClosures } = require('../lib/billingMarks');
 const { unitTotals, TOTAL_COLUMNS } = require('../lib/billingTotals');
 const { featureOn } = require('../lib/features');
 const { computeMandates } = require('../lib/mandates');
+const { inOffice } = require('../lib/cancelReason');
 // Positive-only cache, so the code works before a migration has run.
 const tableSeen = new Set();
 async function hasTable(db, name) {
@@ -267,7 +268,8 @@ async function eiHubSessions(db, month) {
     && mins(o.start_time) < mins(a.appointment_time) + (Number(a.duration) || 30) && mins(a.appointment_time) < mins(o.end_time));
   const appts = apptsAll.filter(a => {
     const date = day10(a.appointment_date);
-    return date < today && !closed.has(date)
+    // An office closure only takes out sessions in the office (Oct 20 2026).
+    return date < today && !(closed.has(date) && inOffice(a.treatment_area))
       && a.appointment_status !== '*HOLD*' && !isHold(a.patient_name)
       && a.appointment_status !== 'Canceled' && a.appointment_status !== 'No Show'
       && !providerOut(a);
