@@ -280,8 +280,18 @@ function allowedOriginFor(event) {
   return list.includes(origin) ? origin : list[0];
 }
 
+// Requests slower than this are logged (Oct 2026: "PedsDesk is slow", and
+// the logs couldn't say which pages). Only the path's shape is logged:
+// patient names and ids in paths become :x (no patient data in logs).
+const SLOW_REQUEST_MS = 1000;
+const pathShape = (p) => String(p || '').split('/').map((seg, i) => (i < 2 || /^[a-z][a-z-]*$/.test(seg) ? seg : ':x')).join('/');
+
 exports.handler = async (event) => {
+  const started = Date.now();
   const response = await handleRequest(event);
+  const ms = Date.now() - started;
+  const method = event?.requestContext?.http?.method;
+  if (method && ms >= SLOW_REQUEST_MS) console.log(`slow request ${method} ${pathShape(event.rawPath || event.requestContext.http.path)} ${ms} ms`);
   if (!response || typeof response !== 'object') return response;
   const origin = allowedOriginFor(event);
   response.headers = { ...(response.headers || {}), 'Access-Control-Allow-Origin': origin, ...(origin === '*' ? {} : { Vary: 'Origin' }) };

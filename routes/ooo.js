@@ -16,6 +16,26 @@ function canManage(currentUser, providerName) {
   return hasManageRole(currentUser) || (!!currentUser.providerName && currentUser.providerName === providerName);
 }
 
+// What staff may change on their own schedule without anyone (Kieran, Oct
+// 2026, Kidz Lounge's schedule window): their own Lunch, Meeting and
+// Unavailable blocks that weren't made in My time (those change in My
+// time, so the request and the block stay in step). Before this, "own
+// provider" was enough, so the API would let staff change or delete their
+// own PTO block, though no screen offered it. Reception / Admins /
+// Developers are unchanged. Mirrors SELF_SERVE_TYPES in routes/timeOff.js.
+const SELF_SERVE = new Set(['Lunch', 'Meeting', 'Unavailable']);
+const OWN_ONLY = 'You can change your own Lunch, Meeting and Unavailable times here. Ask the office to change anything else.';
+const IN_MY_TIME = 'This was added in My time, so change it there.';
+// null = allowed, else the refusal. `row`: the block or series as stored.
+function staffChangeRefusal(currentUser, row, next = null) {
+  if (hasManageRole(currentUser)) return null;
+  if (!currentUser.providerName || row.provider !== currentUser.providerName) return 'You can only manage your own out-of-office entries.';
+  if (!SELF_SERVE.has(row.type)) return OWN_ONLY;
+  if (row.time_off_request_id) return IN_MY_TIME;
+  if (next && ((next.type && !SELF_SERVE.has(next.type)) || (next.provider && next.provider !== currentUser.providerName))) return OWN_ONLY;
+  return null;
+}
+
 async function handle({ path, method, qs, body, db, currentUser }) {
   if (path === '/ooo/window' && method === 'GET') {
     const { start, end } = qs;
@@ -126,11 +146,10 @@ async function handle({ path, method, qs, body, db, currentUser }) {
 
   if (path.match(/^\/ooo\/[^/]+$/) && method === 'PUT') {
     const id = path.split('/').pop();
-    const existingRes = await db.query('SELECT provider FROM "Out_of_Office" WHERE id=$1', [id]);
+    const existingRes = await db.query('SELECT * FROM "Out_of_Office" WHERE id=$1', [id]);
     if (!existingRes.rows[0]) return json(404, { error: 'Out-of-office entry not found.' });
-    if (!canManage(currentUser, existingRes.rows[0].provider)) {
-      return json(403, { error: 'You can only manage your own out-of-office entries.' });
-    }
+    const refusal = staffChangeRefusal(currentUser, existingRes.rows[0], body || {});
+    if (refusal) return json(403, { error: refusal });
     const { provider, ooo_date, start_time, end_time, type, comments } = body;
     // Same fix as the Appointments update: don't blank out comments just
     // because this particular caller's payload doesn't include them.
@@ -144,29 +163,31 @@ async function handle({ path, method, qs, body, db, currentUser }) {
 
   if (path.match(/^\/ooo\/[^/]+\/mark-deleted$/) && method === 'PUT') {
     const id = path.split('/')[2];
-    const existingRes = await db.query('SELECT provider FROM "Out_of_Office" WHERE id=$1', [id]);
+    const existingRes = await db.query('SELECT * FROM "Out_of_Office" WHERE id=$1', [id]);
     if (!existingRes.rows[0]) return json(404, { error: 'Out-of-office entry not found.' });
-    if (!canManage(currentUser, existingRes.rows[0].provider)) {
-      return json(403, { error: 'You can only manage your own out-of-office entries.' });
-    }
+    const refusal = staffChangeRefusal(currentUser, existingRes.rows[0]);
+    if (refusal) return json(403, { error: refusal });
     const result = await db.query('UPDATE "Out_of_Office" SET deleted=true WHERE id=$1 RETURNING *', [id]);
     return json(200, result.rows[0]);
   }
 
   if (path.match(/^\/ooo\/[^/]+$/) && method === 'DELETE') {
     const id = path.split('/').pop();
-    const existingRes = await db.query('SELECT provider FROM "Out_of_Office" WHERE id=$1', [id]);
+    const existingRes = await db.query('SELECT * FROM "Out_of_Office" WHERE id=$1', [id]);
     if (!existingRes.rows[0]) return json(404, { error: 'Out-of-office entry not found.' });
-    if (!canManage(currentUser, existingRes.rows[0].provider)) {
-      return json(403, { error: 'You can only manage your own out-of-office entries.' });
-    }
+    const refusal = staffChangeRefusal(currentUser, existingRes.rows[0]);
+    if (refusal) return json(403, { error: refusal });
     await db.query('DELETE FROM "Out_of_Office" WHERE id=$1', [id]);
     return json(200, { deleted: true });
   }
 
   if (path === '/ooo-series' && method === 'POST') {
-    if (!hasManageRole(currentUser)) return json(403, { error: 'Admin access required. Submit a Time Off request instead.' });
     const { provider, weekday, start_time, end_time, type, start_date } = body;
+    // Staff: only their own Lunch / Meeting / Unavailable (a weekly block's
+    // "This & all future" change ends the old series and starts this one).
+    if (!hasManageRole(currentUser) && !(currentUser.providerName && provider === currentUser.providerName && SELF_SERVE.has(type))) {
+      return json(403, { error: 'Admin access required. Submit a Time Off request instead.' });
+    }
     if (provider == null || weekday == null || !start_time || !end_time || !type || !start_date) {
       return json(400, { error: 'provider, weekday, start_time, end_time, type, and start_date are required.' });
     }
@@ -180,11 +201,10 @@ async function handle({ path, method, qs, body, db, currentUser }) {
 
   if (path.match(/^\/ooo-series\/[^/]+\/end$/) && method === 'PUT') {
     const seriesId = path.split('/')[2];
-    const seriesRes = await db.query('SELECT provider FROM "OOO_RecurringSeries" WHERE id=$1', [seriesId]);
+    const seriesRes = await db.query('SELECT * FROM "OOO_RecurringSeries" WHERE id=$1', [seriesId]);
     if (!seriesRes.rows[0]) return json(404, { error: 'Series not found.' });
-    if (!canManage(currentUser, seriesRes.rows[0].provider)) {
-      return json(403, { error: 'You can only manage your own out-of-office entries.' });
-    }
+    const refusal = staffChangeRefusal(currentUser, seriesRes.rows[0]);
+    if (refusal) return json(403, { error: refusal });
     const { end_date } = body;
     if (!end_date) return json(400, { error: 'end_date is required.' });
     const result = await db.query('UPDATE "OOO_RecurringSeries" SET end_date=$1, updated_at=now() WHERE id=$2 RETURNING *', [end_date, seriesId]);
@@ -198,11 +218,10 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   // and all future," never by the edit-and-split flow.
   if (path.match(/^\/ooo-series\/[^/]+\/purge-future-exceptions$/) && method === 'PUT') {
     const seriesId = path.split('/')[2];
-    const seriesRes = await db.query('SELECT provider FROM "OOO_RecurringSeries" WHERE id=$1', [seriesId]);
+    const seriesRes = await db.query('SELECT * FROM "OOO_RecurringSeries" WHERE id=$1', [seriesId]);
     if (!seriesRes.rows[0]) return json(404, { error: 'Series not found.' });
-    if (!canManage(currentUser, seriesRes.rows[0].provider)) {
-      return json(403, { error: 'You can only manage your own out-of-office entries.' });
-    }
+    const refusal = staffChangeRefusal(currentUser, seriesRes.rows[0]);
+    if (refusal) return json(403, { error: refusal });
     const { from_date } = body;
     if (!from_date) return json(400, { error: 'from_date is required.' });
     const result = await db.query(
@@ -228,6 +247,16 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     if (!series) return json(404, { error: 'Series not found.' });
     if (!canManage(currentUser, series.provider)) {
       return json(403, { error: 'You can only manage your own out-of-office entries.' });
+    }
+    // Staff may always make an unchanged copy of their own occurrence (that
+    // happens when they comment on it, whatever its type); changing or
+    // removing one follows the self-serve rule.
+    const hm = (t) => String(t || '').slice(0, 5);
+    const unchanged = !deleted && (!ooo_date || ooo_date === occurrence_date) && (!provider || provider === series.provider)
+      && (!start_time || hm(start_time) === hm(series.start_time)) && (!end_time || hm(end_time) === hm(series.end_time)) && (!type || type === series.type);
+    if (!unchanged) {
+      const refusal = staffChangeRefusal(currentUser, series, { type, provider });
+      if (refusal) return json(403, { error: refusal });
     }
 
     const result = await db.query(
