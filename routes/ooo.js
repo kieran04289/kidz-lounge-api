@@ -27,11 +27,13 @@ const SELF_SERVE = new Set(['Lunch', 'Meeting', 'Unavailable']);
 const OWN_ONLY = 'You can change your own Lunch, Meeting and Unavailable times here. Ask the office to change anything else.';
 const IN_MY_TIME = 'This was added in My time, so change it there.';
 // null = allowed, else the refusal. `row`: the block or series as stored.
-function staffChangeRefusal(currentUser, row, next = null) {
+// `skipDay`: removing one date of a weekly series made in My time ("Remove
+// just this day", Kieran, Nov 2026): the weekly entry itself is untouched.
+function staffChangeRefusal(currentUser, row, next = null, { skipDay = false } = {}) {
   if (hasManageRole(currentUser)) return null;
   if (!currentUser.providerName || row.provider !== currentUser.providerName) return 'You can only manage your own out-of-office entries.';
   if (!SELF_SERVE.has(row.type)) return OWN_ONLY;
-  if (row.time_off_request_id) return IN_MY_TIME;
+  if (row.time_off_request_id && !skipDay) return IN_MY_TIME;
   if (next && ((next.type && !SELF_SERVE.has(next.type)) || (next.provider && next.provider !== currentUser.providerName))) return OWN_ONLY;
   return null;
 }
@@ -165,7 +167,8 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     const id = path.split('/')[2];
     const existingRes = await db.query('SELECT * FROM "Out_of_Office" WHERE id=$1', [id]);
     if (!existingRes.rows[0]) return json(404, { error: 'Out-of-office entry not found.' });
-    const refusal = staffChangeRefusal(currentUser, existingRes.rows[0]);
+    // One date of a weekly entry (an occurrence row): "Remove just this day".
+    const refusal = staffChangeRefusal(currentUser, existingRes.rows[0], null, { skipDay: !!existingRes.rows[0].exception_of_series_id });
     if (refusal) return json(403, { error: refusal });
     const result = await db.query('UPDATE "Out_of_Office" SET deleted=true WHERE id=$1 RETURNING *', [id]);
     return json(200, result.rows[0]);
@@ -255,7 +258,8 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     const unchanged = !deleted && (!ooo_date || ooo_date === occurrence_date) && (!provider || provider === series.provider)
       && (!start_time || hm(start_time) === hm(series.start_time)) && (!end_time || hm(end_time) === hm(series.end_time)) && (!type || type === series.type);
     if (!unchanged) {
-      const refusal = staffChangeRefusal(currentUser, series, { type, provider });
+      const skipDay = !!deleted && (!ooo_date || ooo_date === occurrence_date);
+      const refusal = staffChangeRefusal(currentUser, series, { type, provider }, { skipDay });
       if (refusal) return json(403, { error: refusal });
     }
 
