@@ -2,7 +2,7 @@ const { json } = require('../lib/http');
 const { canManage, canUseEiHub, canAdminister } = require('../lib/roles');
 const { getMergedAppointments, getMergedOOO } = require('../lib/recurring');
 const { clinicToday, isHold, currentCaseloads } = require('../lib/caseload');
-const { loadSchedule, chargeForRequest, addDays, round2 } = require('../lib/workSchedule');
+const { loadSchedule, hoursInRange, addDays, round2 } = require('../lib/workSchedule');
 const patientPrograms = require('../lib/patientPrograms');
 const { makeMarker, loadClosures } = require('../lib/billingMarks');
 const { unitTotals, TOTAL_COLUMNS } = require('../lib/billingTotals');
@@ -368,9 +368,10 @@ async function eiHubSessions(db, month) {
   return { month, start, end, today, tracking: await hasTable(db, 'EiHubEntries'), sessions };
 }
 
-// The provider's approved PTO and UPTO for days in the month, in hours --
-// the same scheduled-hours cost as the request itself (lib/workSchedule.js),
-// counting only a cross-month request's days in this month.
+// The provider's approved PTO and UPTO for days in the month, in hours:
+// each request's approved (charged) hours, and for one crossing the month
+// only its share in this month (hoursInRange in lib/workSchedule.js, shared
+// with Admin > Time off > Time taken).
 async function timeOffHours(db, provider, start, end) {
   const out = { PTO: 0, UPTO: 0, requests: [] };
   const staff = (await db.query(
@@ -392,7 +393,7 @@ async function timeOffHours(db, provider, start, end) {
   for (const r0 of reqs) {
     const r = { ...r0, start_date: day(r0.start_date), end_date: day(r0.end_date) };
     const from = r.start_date > start ? r.start_date : start;
-    const hours = round2(chargeForRequest(schedule, r, from) - (r.end_date > end ? chargeForRequest(schedule, r, addDays(end, 1)) : 0));
+    const hours = hoursInRange(schedule, r, start, end);
     if (hours <= 0) continue;
     out[r.request_type] = round2(out[r.request_type] + hours);
     out.requests.push({ type: r.request_type, start_date: from, end_date: r.end_date > end ? end : r.end_date, hours });

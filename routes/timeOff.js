@@ -4,7 +4,7 @@ const { displayNameFor } = require('../lib/utils');
 const { hasAgendaTable, hasCommentsTable, getAgenda, setAgenda, getMeetingComments, setMeetingComments } = require('../lib/meetingAgendas');
 const {
   PTO_RATE, PTO_BALANCE_CAP, PTO_CARRYOVER_MAX, POLICY_START,
-  chargeHoursFor, consecutivePtoCheck, loadStaff, loadSchedule, weeklyScheduledHours, mondayOf, addDays, round2,
+  chargeHoursFor, consecutivePtoCheck, loadStaff, loadSchedule, weeklyScheduledHours, hoursInRange, mondayOf, addDays, round2,
 } = require('../lib/workSchedule');
 const { adjustBalance, removeUsage, hasLedgerTable, editWeekHours, WEEKLY_ACCRUAL_ENABLED } = require('../lib/ptoAccrual');
 const { UPTO_MONTHLY_HOURS } = require('../lib/timeOffAccrual');
@@ -1048,6 +1048,58 @@ async function handle({ path, method, qs, body, db, currentUser }) {
     }
     rows.sort((x, y) => x.display_name.localeCompare(y.display_name));
     return json(200, { rows, balance_cap: PTO_BALANCE_CAP });
+  }
+
+  // PTO and UPTO taken from..to, per person (Kieran, Nov 2026: Admin > Time
+  // off > Time taken, "an easier spot to look at all staff PTO & UPTO" with
+  // date ranges and a total). Approved requests only, each counted by
+  // hoursInRange (its approved hours; the share inside the range when it
+  // crosses an edge) -- the same figure as the billing sheet. Lists every
+  // active employee with PTO or UPTO (salaried / hourly), at 0 when they
+  // took none, plus anyone else (archived too) who took some in the range.
+  if (path === '/time-off/taken' && method === 'GET') {
+    if (!canAdminister(currentUser)) return json(403, { error: 'Admin access required.' });
+    const isDay = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || ''));
+    const { from, to } = qs;
+    if (!isDay(from) || !isDay(to) || to < from) return json(400, { error: 'Choose a start date and an end date on or after it.' });
+    if (addDays(from, 731) < to) return json(400, { error: 'Choose a range of two years or less.' });
+    const hasType = await hasEmploymentColumn(db);
+    const reqs = (await db.query(
+      `SELECT * FROM "TimeOffRequests" WHERE status='approved' AND is_balance_type AND request_type IN ('PTO', 'UPTO')
+         AND start_date <= $2 AND end_date >= $1 ORDER BY start_date`, [from, to]
+    )).rows.map(r => ({ ...r, start_date: String(r.start_date).slice(0, 10), end_date: String(r.end_date).slice(0, 10) }));
+    const byUser = {};
+    reqs.forEach(r => { (byUser[r.username] ||= []).push(r); });
+    const staffRes = await db.query(
+      `SELECT username, provider_name, hire_date, archived, role, first_name, middle_name, last_name, preferred_name${hasType ? ', employment_type' : ''}
+       FROM "Staff" WHERE (archived = false${hasType ? ` AND employment_type IN ('salaried', 'hourly')` : ''}) OR username = ANY($1)`,
+      [Object.keys(byUser)]
+    );
+    const rows = [];
+    for (const staff of staffRes.rows) {
+      // Admins don't see Developers' accounts (src/roles.js showsStaffAccount).
+      if (staff.role === 'developer' && currentUser.role !== 'developer' && !byUser[staff.username]) continue;
+      const list = byUser[staff.username] || [];
+      const row = { username: staff.username, display_name: displayNameFor(staff), employment_type: hasType ? (staff.employment_type || 'neither') : 'salaried', archived: !!staff.archived, PTO: 0, UPTO: 0, requests: [] };
+      if (list.length) {
+        const lo = list.reduce((m, r) => (r.start_date < m ? r.start_date : m), from);
+        const hi = list.reduce((m, r) => (r.end_date > m ? r.end_date : m), to);
+        const schedule = await loadSchedule(db, staff, lo, hi);
+        for (const r of list) {
+          const hours = hoursInRange(schedule, r, from, to);
+          if (hours <= 0) continue;
+          row[r.request_type] = round2(row[r.request_type] + hours);
+          row.requests.push({
+            id: r.id, type: r.request_type, start_date: r.start_date, end_date: r.end_date, start_time: r.start_time, end_time: r.end_time,
+            hours, partial: r.start_date < from || r.end_date > to, notes: r.notes || null,
+          });
+        }
+      }
+      rows.push(row);
+    }
+    rows.sort((x, y) => x.display_name.localeCompare(y.display_name));
+    const totals = { PTO: round2(rows.reduce((t, r) => t + r.PTO, 0)), UPTO: round2(rows.reduce((t, r) => t + r.UPTO, 0)) };
+    return json(200, { from, to, rows, totals });
   }
 
   // Set someone's PTO "as of" a date (Oct 2026 policy: no weekly accrual).
