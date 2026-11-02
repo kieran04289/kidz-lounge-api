@@ -509,7 +509,10 @@ async function handlePublic({ path, method, body, db, meta }) {
     const child_first_name = String(patient.Name || '').trim().split(/\s+/)[0] || null;
     // The form is labelled with who it's for, like a chart label, and the
     // patient's saved details are filled in (only now the DOB matched).
-    const label = { name: patient.Name, dob: real, mrn: patient.mrn || null };
+    // `program` / `id_number`: a clinic may show the EI child ID in place
+    // of the MRN for EI children (the website decides: patientLabelId in
+    // src/powerForms.js; Kidz Lounge, Nov 2026).
+    const label = { name: patient.Name, dob: real, mrn: patient.mrn || null, program: patient.Program || null, id_number: patient.ID_Number || null };
     const fill = (fields) => pf.withPatient(fields, patient);
     if (kind === 'packet') {
       await db.query('UPDATE "PowerFormPackets" SET failed_checks=0, opened_at=COALESCE(opened_at, now()) WHERE id=$1', [link.id]);
