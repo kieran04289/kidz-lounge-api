@@ -38,6 +38,8 @@ const mins = (t) => { const [h, m] = String(t).split(':').map(Number); return h 
 const pad = (n) => String(n).padStart(2, '0');
 
 // EI, DOE (CPSE/CSE), or Other (insurance, P, PP, none).
+// DOE session lengths that count, in 30-minute units (lib/billingTotals.js).
+const DOE_MINUTES = [30, 45, 60];
 function groupFor(program) {
   const parts = String(program || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
   if (parts.includes('EI')) return 'EI';
@@ -139,10 +141,15 @@ async function buildSheet(db, provider, month) {
     const row = rowFor(a.patient_name, program, mandate, code, settingOf(a.treatment_area) || '');
     const d = Number(date.slice(8, 10));
     const mark = markFor(a);
-    if (mark === 'X' || mark === 'M' || mark === 'E') row.total_sessions += 1;
+    // DOE rows count in 30-minute units, as DOE bills (Kieran, Nov 2026):
+    // 30 min = 1, 45 = 1.5, 60 = 2 -- the same as the DOE 30 total under
+    // the sheet. Other lengths count 1 (they're under Not counted to fix).
+    const minutes = Number(a.duration) || 30;
+    const weight = row.group === 'DOE' && DOE_MINUTES.includes(minutes) ? minutes / 30 : 1;
+    if (mark === 'X' || mark === 'M' || mark === 'E') row.total_sessions += weight;
     // Sessions on a closed day (H or Z) still show, but aren't scheduled; nor
     // is a make-up -- the canceled session it replaces already was.
-    if (mark !== 'H' && mark !== 'Z' && !a.is_makeup) row.scheduled += 1;
+    if (mark !== 'H' && mark !== 'Z' && !a.is_makeup) row.scheduled += weight;
     (row.days[d] = row.days[d] || []).push({ mark, status: a.appointment_status, time: String(a.appointment_time).slice(0, 5), room: a.treatment_area || null, id: a.id, outside_hours: !!a.outside_hours, duration: Number(a.duration) || 30 });
   }
   // On the caseload with no sessions this month (booked later on): their program today.
