@@ -361,7 +361,14 @@ async function handle(ctx) {
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
       [patient_name, provider, weekday, appointment_time, duration || 30, treatment_area || null, appointment_status || 'Scheduled', start_date, end_date || null]
     );
-    return json(201, await applyHoursOkFromBody(db, 'RecurringSeries', await applyOutsideHours(db, result.rows[0], body, { table: 'RecurringSeries' }), body, currentUser));
+    // "This & all future" on one child of a group class starts a new series
+    // for them; it stays in the class (only sent for a group child, so the
+    // column exists).
+    let row = result.rows[0];
+    if (body.group_class_id != null && /^\d+$/.test(String(body.group_class_id))) {
+      row = (await db.query('UPDATE "RecurringSeries" SET group_class_id=$1 WHERE id=$2 RETURNING *', [body.group_class_id, row.id])).rows[0];
+    }
+    return json(201, await applyHoursOkFromBody(db, 'RecurringSeries', await applyOutsideHours(db, row, body, { table: 'RecurringSeries' }), body, currentUser));
   }
 
   // Ends a series at a given date (used for "edit this and all future" --
@@ -516,8 +523,13 @@ async function handle(ctx) {
         deleted || false,
       ]
     );
+    // A group class child's occurrence stays in the class (routes/groupClasses.js).
+    let row = result.rows[0];
+    if (series.group_class_id != null) {
+      row = (await db.query('UPDATE "Appointments" SET group_class_id=$1 WHERE id=$2 RETURNING *', [series.group_class_id, row.id])).rows[0];
+    }
     // An occurrence of an outside-hours series stays outside hours unless told otherwise.
-    return json(201, await applySessionDetails(db, result.rows[0], body, { fallback: !!series.outside_hours }, currentUser));
+    return json(201, await applySessionDetails(db, row, body, { fallback: !!series.outside_hours }, currentUser));
   }
 
   // Marks an existing real exception row as deleted, rather than removing
@@ -536,4 +548,5 @@ async function handle(ctx) {
   return null;
 }
 
-module.exports = { handle };
+// Shared with routes/groupClasses.js, which saves each child's session the same way.
+module.exports = { handle, signedLock, signedSeriesFrom, retiredAreaRefusal, areaAfterStatus };
