@@ -6,8 +6,8 @@ const { signedRecordsFor } = require('../lib/sessionNotes');
 const { canManage } = require('../lib/roles');
 const { displayNameFor } = require('../lib/utils');
 
-// Group classes (Kieran, Nov 2026; the "groupclasses" feature, PedsDesk
-// first). One provider with several children at the same time, booked from
+// Group classes (Kieran, Nov 2026; the "groupclasses" feature, both
+// clinics). One provider with several children at the same time, booked from
 // the appointment window ("Group class" in place of a patient).
 //
 // Each child gets an ordinary appointment -- a one-time row, or their own
