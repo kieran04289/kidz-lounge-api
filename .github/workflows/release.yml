@@ -1,17 +1,18 @@
 name: Nightly release to Kidz Lounge
 
-# At 11 PM New York time, whatever is on main (already running on Demo) goes
+# At 2 AM New York time, whatever is on main (already running on Demo) goes
 # to Kidz Lounge: code, then migrations. The `production` branch marks what
 # Kidz Lounge is running, so a night with nothing new does nothing. The
-# frontend's own release runs at 11:30 PM and waits for this one to succeed.
+# frontend's own release follows once this one has finished.
 #
-# GitHub schedules are in UTC, so there are two: only the one that lands on
-# 11 PM in New York (summer or winter time) goes ahead.
+# GitHub starts scheduled runs late, often by hours (the 11 PM release ran
+# at 5:51 and 6:51 AM, Nov 2026), so it checks every hour and the first check
+# that actually starts between 2 and 5 AM in New York releases; the rest find
+# nothing new. A check outside those hours stops straight away.
 # "Run workflow" on this workflow's Actions page = release now (urgent fixes).
 on:
   schedule:
-    - cron: '0 3 * * *' # 11 PM EDT (summer)
-    - cron: '0 4 * * *' # 11 PM EST (winter)
+    - cron: '7 * * * *' # hourly, off the top of the hour (GitHub's busiest)
   workflow_dispatch:
 
 concurrency:
@@ -24,19 +25,23 @@ jobs:
     outputs:
       go: ${{ steps.check.outputs.go }}
     steps:
+      - id: when
+        run: |
+          hour=$(TZ=America/New_York date +%H)
+          if [ "${{ github.event_name }}" = schedule ] && { [ "$hour" -lt 2 ] || [ "$hour" -ge 5 ]; }; then
+            echo "Not between 2 and 5 AM in New York; waiting."; echo go=false >> "$GITHUB_OUTPUT"
+          else
+            echo go=true >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.when.outputs.go == 'true'
         with:
           fetch-depth: 0
 
       - id: check
+        if: steps.when.outputs.go == 'true'
         run: |
-          if [ "${{ github.event_name }}" = schedule ]; then
-            zone=$(TZ=America/New_York date +%Z)
-            case "${{ github.event.schedule }}/$zone" in
-              "0 3 * * */EDT"|"0 4 * * */EST") ;;
-              *) echo "Not 11 PM in New York ($zone); the other schedule handles tonight."; echo go=false >> "$GITHUB_OUTPUT"; exit 0 ;;
-            esac
-          fi
           if git rev-parse -q --verify origin/production > /dev/null && [ "$(git rev-parse origin/production)" = "$(git rev-parse HEAD)" ]; then
             echo "Nothing new since the last release."; echo go=false >> "$GITHUB_OUTPUT"; exit 0
           fi

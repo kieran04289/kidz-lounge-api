@@ -115,7 +115,7 @@ Every job must be safe to re-run: accrual jobs record what they've credited and 
   - **No `BEGIN;` / `COMMIT;` in a migration file.** The runner refuses one, because it wraps each file itself. (`BEGIN` inside a `DO $$` block is fine.)
   - **One-time data fixes go in `../kidz-lounge-scripts`, never in `migrations/`.** Every new clinic database would run them.
   - A database the runner has never seen refuses to run until the files already in effect are recorded without running: `"markExistingUpTo": "<last file it has>"`. This protects `2026-10-05_clear_salaried_pto.sql` (zeroes salaried PTO) from running again.
-  - **The deploy workflows run it** after every deploy (Demo on push, Kidz Lounge at 11 PM). To run it by hand:
+  - **The deploy workflows run it** after every deploy (Demo on push, Kidz Lounge at 2 AM). To run it by hand:
     ```
     aws lambda invoke --profile kl-prod --function-name kidz-lounge-api \
       --cli-binary-format raw-in-base64-out --payload '{"source":"deploy","job":"migrate"}' /dev/stdout
