@@ -3,6 +3,8 @@ const { featureOn } = require('../lib/features');
 const { getMergedAppointments } = require('../lib/recurring');
 const { isHold } = require('../lib/caseload');
 const { signedRecordsFor } = require('../lib/sessionNotes');
+const { canManage } = require('../lib/roles');
+const { displayNameFor } = require('../lib/utils');
 
 // Group classes (Kieran, Nov 2026; the "groupclasses" feature, PedsDesk
 // first). One provider with several children at the same time, booked from
@@ -23,6 +25,7 @@ const MIN_CHILDREN = 2;
 // NYC's EI group sessions are 2 to 10 children (lib/sessionNotes.js).
 const MAX_CHILDREN = 10;
 const MIGRATION = '2026-11-18_group_classes.sql';
+const COMMENTS_MIGRATION = '2026-11-19_group_class_comments.sql';
 
 let tableSeen = false; // only a "yes" is remembered
 async function hasGroupTable(db) {
@@ -30,6 +33,14 @@ async function hasGroupTable(db) {
   const r = await db.query(`SELECT to_regclass('"GroupClasses"') IS NOT NULL AS ok`);
   tableSeen = !!r.rows[0]?.ok;
   return tableSeen;
+}
+
+let commentsSeen = false; // only a "yes" is remembered
+async function hasCommentsTable(db) {
+  if (commentsSeen) return true;
+  const r = await db.query(`SELECT to_regclass('"GroupClassComments"') IS NOT NULL AS ok`);
+  commentsSeen = !!r.rows[0]?.ok;
+  return commentsSeen;
 }
 
 // Thrown inside a transaction to roll back and answer with `response`.
@@ -294,6 +305,43 @@ async function handle({ path, method, body, db, currentUser }) {
     return json(200, row);
   }
 
+  // The class's comments for one sitting (its date): { date, action:
+  // 'append', text } or { date, action: 'delete', commentId }. Same format
+  // and rules as an appointment's comments (routes/appointments.js).
+  if (step === 'comments' && method === 'PUT') {
+    if (!(await hasCommentsTable(db))) return json(503, { error: `Class comments need the database update (${COMMENTS_MIGRATION}) to be run first.` });
+    const date = day(b.date);
+    if (!date || !DATE_RE.test(date)) return json(400, { error: 'date is required.' });
+    const row = (await db.query('SELECT comments FROM "GroupClassComments" WHERE group_class_id=$1 AND class_date=$2', [group.id, date])).rows[0];
+    let list = [];
+    try { list = row?.comments ? JSON.parse(row.comments) : []; } catch { list = []; }
+    if (b.action === 'append') {
+      const text = String(b.text || '').trim();
+      if (!text) return json(400, { error: 'Comment text is required.' });
+      list.push({
+        id: list.reduce((max, c) => Math.max(max, c.id || 0), 0) + 1,
+        author_username: currentUser.username,
+        author_display: displayNameFor({ username: currentUser.username, first_name: currentUser.firstName, last_name: currentUser.lastName, preferred_name: currentUser.preferredName }),
+        timestamp: new Date().toISOString(),
+        text,
+      });
+    } else if (b.action === 'delete') {
+      const target = list.find(c => c.id === b.commentId);
+      if (!target) return json(404, { error: 'Comment not found.' });
+      if (target.author_username !== currentUser.username && !canManage(currentUser)) return json(403, { error: 'You can only delete your own comments.' });
+      list = list.filter(c => c.id !== b.commentId);
+    } else {
+      return json(400, { error: 'Unknown comment action.' });
+    }
+    const stored = list.length ? JSON.stringify(list) : null;
+    await db.query(
+      `INSERT INTO "GroupClassComments" (group_class_id, class_date, comments) VALUES ($1,$2,$3)
+       ON CONFLICT (group_class_id, class_date) DO UPDATE SET comments=EXCLUDED.comments, updated_at=now()`,
+      [group.id, date, stored]
+    );
+    return json(200, { comments: stored });
+  }
+
   if (method !== 'POST') return null;
   const date = day(b.date);
   if (!date || !DATE_RE.test(date)) return json(400, { error: 'date is required.' });
@@ -359,6 +407,15 @@ async function handle({ path, method, body, db, currentUser }) {
       for (const row of members) {
         if (scope === 'future' && seriesIdOf(row)) await moveSeriesFrom(client, row, date, f);
         else await moveOne(client, row, f);
+      }
+      // The sitting's comments go with it to its new date (unless that date
+      // already has its own thread).
+      if (f.appointment_date !== date && (await hasCommentsTable(client))) {
+        await client.query(
+          `UPDATE "GroupClassComments" SET class_date=$1, updated_at=now() WHERE group_class_id=$2 AND class_date=$3
+             AND NOT EXISTS (SELECT 1 FROM "GroupClassComments" WHERE group_class_id=$2 AND class_date=$1)`,
+          [f.appointment_date, group.id, date]
+        );
       }
       return json(200, { moved: members.length, scope });
     });
