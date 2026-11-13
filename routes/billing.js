@@ -146,7 +146,7 @@ async function buildSheet(db, provider, month) {
     // the sheet. Other lengths count 1 (they're under Not counted to fix).
     const minutes = Number(a.duration) || 30;
     const weight = row.group === 'DOE' && DOE_MINUTES.includes(minutes) ? minutes / 30 : 1;
-    if (mark === 'X' || mark === 'M' || mark === 'E') row.total_sessions += weight;
+    if (mark === 'X' || mark === 'G' || mark === 'M' || mark === 'E') row.total_sessions += weight;
     // Sessions on a closed day (H or Z) still show, but aren't scheduled; nor
     // is a make-up -- the canceled session it replaces already was.
     if (mark !== 'H' && mark !== 'Z' && !a.is_makeup) row.scheduled += weight;
