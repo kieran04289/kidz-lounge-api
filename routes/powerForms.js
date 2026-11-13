@@ -3,6 +3,7 @@ const { json } = require('../lib/http');
 const { canManage, canAdminister } = require('../lib/roles');
 const audit = require('../lib/audit');
 const pf = require('../lib/powerForms');
+const nycConsent = require('../lib/nycConsent');
 const { deleteDocument } = require('./documents');
 const { PATIENT_TASK_FALLBACK_ROLES } = require('../lib/roles');
 
@@ -132,7 +133,8 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   }
   if (path === '/power-forms/templates' && method === 'POST') {
     if (!canAdminister(currentUser)) return json(403, { error: 'Only Admins and Developers can build forms.' });
-    const c = pf.cleanTemplate(b);
+    // A copy of the NYC consent keeps NYC's questions (lib/nycConsent.js).
+    const c = pf.cleanTemplate(nycConsent.isNycConsent(b.fields) ? { ...b, fields: nycConsent.lockFields(b.fields) } : b);
     if (c.error) return json(400, { error: c.error });
     const row = (await db.query(
       `INSERT INTO "PowerFormTemplates" (name, intro, fields, created_by) VALUES ($1, $2, $3, $4) RETURNING *`,
@@ -143,7 +145,12 @@ async function handle({ path, method, qs, body, db, currentUser }) {
   const tm = path.match(/^\/power-forms\/templates\/(\d+)$/);
   if (tm && method === 'PUT') {
     if (!canAdminister(currentUser)) return json(403, { error: 'Only Admins and Developers can build forms.' });
-    const c = pf.cleanTemplate(b);
+    // The NYC consent's questions are fixed (Kieran, Nov 2026: it prints as
+    // NYC's own page); only its starting answers and name change. A copy
+    // edited before the lock is put back to NYC's questions on its next save.
+    const before = (await db.query('SELECT fields FROM "PowerFormTemplates" WHERE id=$1', [Number(tm[1])])).rows[0];
+    const locked = nycConsent.isNycConsent(b.fields) || (before && nycConsent.isNycConsent(before.fields));
+    const c = pf.cleanTemplate(locked ? { ...b, fields: nycConsent.lockFields(b.fields, before?.fields) } : b);
     if (c.error) return json(400, { error: c.error });
     const row = (await db.query(
       `UPDATE "PowerFormTemplates" SET name=$1, intro=$2, fields=$3, updated_by=$4, updated_at=now() WHERE id=$5 RETURNING *`,
