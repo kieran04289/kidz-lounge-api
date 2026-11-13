@@ -385,6 +385,103 @@ async function handle(ctx) {
     return json(200, result.rows[0]);
   }
 
+  // "This & all future" for a change to a weekly series' day, time, length,
+  // provider, room or status, from one occurrence on (Kieran, Nov 2026). The
+  // series ends the day before and a copy starts with the new pattern. The
+  // weeks after it that already have their own row (confirmed, commented,
+  // given a room...) move onto the copy: one that still sat on the old
+  // pattern takes the new day and time; one moved on its own keeps its own
+  // date and time. Before this, the frontend ended the series and started a
+  // new one, and those rows stayed at the old time -- so next week showed the
+  // session twice and flagged the child as double-booked.
+  // Body: { from_date (the occurrence's original date), appointment_date,
+  // appointment_time, duration, provider, treatment_area, appointment_status,
+  // and the per-session details the appointment window sends }.
+  if (path.match(/^\/recurring-series\/[^/]+\/change-from$/) && method === 'POST') {
+    const seriesId = path.split('/')[2];
+    const day = (v) => (v ? String(v).slice(0, 10) : null);
+    const hm = (v) => String(v || '').slice(0, 5);
+    const addDays = (d, n) => { const x = new Date(`${d}T00:00:00Z`); x.setUTCDate(x.getUTCDate() + n); return x.toISOString().slice(0, 10); };
+    const from = day(body.from_date);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from || '')) return json(400, { error: 'from_date is required.' });
+    const series = (await db.query('SELECT * FROM "RecurringSeries" WHERE id::text=$1', [seriesId])).rows[0];
+    if (!series) return json(404, { error: 'Series not found.' });
+    const end = day(series.end_date);
+    if (from < day(series.start_date) || (end && from > end)) return json(400, { error: 'That date is outside the series.' });
+    { const refused = retiredAreaRefusal(body.treatment_area, series.treatment_area); if (refused) return refused; }
+    const to = day(body.appointment_date) || from;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(to)) return json(400, { error: 'Pick the date.' });
+    const next = {
+      provider: body.provider || series.provider,
+      appointment_time: hm(body.appointment_time || series.appointment_time),
+      duration: Number(body.duration) || Number(series.duration) || 30,
+      treatment_area: body.treatment_area !== undefined ? (body.treatment_area || null) : series.treatment_area,
+      appointment_status: body.appointment_status || series.appointment_status,
+    };
+    // Sessions from that date on with a signed note, or already in EI-Hub,
+    // are keyed by this series and date: they can't move.
+    const lock = await signedSeriesFrom(db, series.id, from);
+    if (lock) return lock;
+    if ((await db.query(`SELECT to_regclass('"EiHubEntries"') AS t`)).rows[0]?.t) {
+      const entered = (await db.query(`SELECT session_key FROM "EiHubEntries" WHERE session_key LIKE $1 AND split_part(session_key, ':', 3) >= $2 LIMIT 1`, [`series:${series.id}:%`, from])).rows[0];
+      if (entered) return json(409, { error: `The session on ${entered.session_key.split(':')[2]} is already entered in EI-Hub, so the series can't change from ${from}. Change it from a later session, or just this one.` });
+    }
+    // How far the edited date moved (a new weekday, or a later week): every
+    // later week moves the same way.
+    const shift = Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86400000);
+    let target;
+    let edited = null; // the occurrence being edited, when it has its own row
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('UPDATE "RecurringSeries" SET end_date=$1, updated_at=now() WHERE id=$2', [addDays(from, -1), series.id]);
+      // Every column of the series, so newer ones (group class, hours okay...) come along.
+      const set = { ...next, weekday: new Date(`${to}T00:00:00Z`).getUTCDay(), start_date: to, end_date: end ? addDays(end, shift) : null };
+      const cols = Object.keys(series).filter(c => !['id', 'created_at', 'updated_at', ...Object.keys(set)].includes(c));
+      const all = [...cols, ...Object.keys(set)];
+      target = (await client.query(
+        `INSERT INTO "RecurringSeries" (${all.map(c => `"${c}"`).join(', ')}) VALUES (${all.map((_, i) => `$${i + 1}`).join(', ')}) RETURNING *`,
+        [...cols.map(c => series[c]), ...Object.values(set)]
+      )).rows[0];
+      const later = (await client.query('SELECT * FROM "Appointments" WHERE exception_of_series_id=$1 AND exception_occurrence_date >= $2', [series.id, from])).rows;
+      for (const r of later) {
+        const occ = day(r.exception_occurrence_date);
+        const newOcc = addDays(occ, shift);
+        if (occ === from) {
+          // The occurrence being edited: everything from the window.
+          edited = (await client.query(
+            `UPDATE "Appointments" SET exception_of_series_id=$1, exception_occurrence_date=$2, appointment_date=$2, appointment_time=$3, duration=$4, provider=$5,
+               treatment_area=$6, appointment_status=$7, updated_at=now() WHERE id=$8 RETURNING *`,
+            [target.id, to, next.appointment_time, next.duration, next.provider, areaAfterStatus(next.appointment_status, next.treatment_area), next.appointment_status, r.id]
+          )).rows[0];
+          continue;
+        }
+        const onPattern = !r.deleted && day(r.appointment_date) === occ && hm(r.appointment_time) === hm(series.appointment_time);
+        if (onPattern) {
+          // Its own status and comments stay; a missed one keeps its freed room.
+          await client.query(
+            `UPDATE "Appointments" SET exception_of_series_id=$1, exception_occurrence_date=$2, appointment_date=$2, appointment_time=$3, duration=$4, provider=$5,
+               treatment_area = CASE WHEN appointment_status IN ('Canceled', 'No Show') THEN treatment_area ELSE $6 END, updated_at=now() WHERE id=$7`,
+            [target.id, newOcc, next.appointment_time, next.duration, next.provider, next.treatment_area, r.id]
+          );
+        } else {
+          // Moved on its own, or a removed week: stays where it is, under the new series.
+          await client.query('UPDATE "Appointments" SET exception_of_series_id=$1, exception_occurrence_date=$2, updated_at=now() WHERE id=$3', [target.id, newOcc, r.id]);
+        }
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+    // The window's per-session details (cancel reason, why absent, hours okay).
+    target = await applyHoursOkFromBody(db, 'RecurringSeries', target, body, currentUser);
+    if (edited) edited = await applySessionDetails(db, edited, body, undefined, currentUser);
+    return json(200, { series: target, occurrence: edited, moved: shift });
+  }
+
   // A new setting (treatment_area) for a series from one occurrence on
   // (Kieran, Oct 15 2026: Center / School / Home "this and all future"). The
   // series ends the day before and a copy starts on from_date with the new
